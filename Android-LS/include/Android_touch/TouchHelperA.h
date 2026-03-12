@@ -51,7 +51,7 @@ static std::vector<DeviceConfig> devices;
 static std::mutex touch_mutex; // 全局触摸数据锁
 
 // 更新屏幕信息
-void UpdateScreenData(int w, int h, uint32_t orientation_)
+inline void UpdateScreenData(int w, int h, uint32_t orientation_)
 {
     screenWidth.store((float)w, std::memory_order_relaxed);
     screenHeight.store((float)h, std::memory_order_relaxed);

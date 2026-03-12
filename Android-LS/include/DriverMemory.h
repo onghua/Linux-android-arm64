@@ -434,25 +434,45 @@ public: // 外部获取内存信息
 
         const auto &info = GetMemoryInfoRef();
 
-        // 遍历所有模块，查找目标模块
         for (int i = 0; i < info.module_count; ++i)
         {
             const auto &mod = info.modules[i];
 
             std::string_view fullPath(mod.name);
 
-            // 长度不够则跳过
             if (fullPath.length() < moduleName.length())
                 continue;
 
-            // 尾部匹配 + 前一个字符必须是 '/' 防止误匹配
             size_t pos = fullPath.length() - moduleName.length();
             if (pos > 0 && fullPath[pos - 1] != '/')
                 continue;
             if (fullPath.substr(pos) != moduleName)
                 continue;
 
-            // 找到目标模块，查找目标区段
+            // =============================================
+            // 输出该模块的所有信息
+            // =============================================
+            std::println(stderr, "========== 模块信息 ==========");
+            std::println(stderr, "  模块索引  : {}", i);
+            std::println(stderr, "  模块名称  : {}", mod.name);
+            std::println(stderr, "  区段数量  : {}", mod.seg_count);
+            std::println(stderr, "  ----------------------------");
+
+            for (int j = 0; j < mod.seg_count; ++j)
+            {
+                const auto &seg = mod.segs[j];
+                std::println(stderr, "  区段[{}]:", j);
+                std::println(stderr, "    index : {}", seg.index);
+                std::println(stderr, "    start : 0x{:016X}", seg.start);
+                std::println(stderr, "    end   : 0x{:016X}", seg.end);
+                std::println(stderr, "    size  : 0x{:X} ({} bytes)", seg.end - seg.start, seg.end - seg.start);
+                std::println(stderr, "    prot  : {}", seg.prot);
+            }
+
+            std::println(stderr, "==============================");
+            // =============================================
+
+            // 查找目标区段
             for (int j = 0; j < mod.seg_count; ++j)
             {
                 const auto &seg = mod.segs[j];
@@ -463,80 +483,117 @@ public: // 外部获取内存信息
                 return true;
             }
 
-            // 下面这个其实可以不管了!!!,不管了!!!，已经在内核层修复
-            // (这里讲解一下所有问题已经在内核层已经修复了!!!)
-            /*
-             * =========================================================================================
-             * 反作弊 VMA 碎裂与诱饵对抗机制
-             * =========================================================================================
-             *
-             * 【第一阶段：理想状态下的纯净内存布局 (原生 ELF 加载)】
-             * 当 Linux/Android 原生加载一个 libil2cpp.so 时，它在内存中的排布是非常连续且规律的。
-             * 现代 Android 系统（特别是 LLVM/Clang 编译的 64 位）出于安全考虑，
-             * 原生加载时至少会产生 4 到 6 个连续的 VMA 区段（小的 so 文件会有 1 到 2 个）：
-             *   1. 头部 (RO): 包含 ELF Header 和 Program Header，真实的 Base Address 起点。
-             *   2. 代码 (RX): .text 段，紧跟在头部之后。
-             *   3. RELRO (RO): 系统安全机制，写完重定位表后强行锁死为只读，凭空多出第二个 RO 段。
-             *   4. 数据 (RW): .data 全局变量段。
-             *   5. BSS  (RW): 尾部额外分配的无文件映射的匿名读写内存。
-             * 所以，即使没有反作弊，最纯净的环境也会产生 [RO -> RX -> RO -> RW -> RW] 的天然区段。
-             * 此时驱动收集到的区段严格按照物理内存的先后顺序自然排列。
-             *
-             * 【第二阶段：反作弊系统的双重伪装攻击】
-             * 现代顶级反作弊（如 ACE）为了防止外部读取和内存 Dump，会做两件极其恶心的事情：
-             *
-             *   攻击手段 1：VMA 碎裂
-             *   反作弊为了 Hook 游戏内部函数，会高频调用 mprotect() 修改代码段的权限。
-             *   Linux 内核为了管理不同的物理页权限，被迫将原本 1 个巨大的 RX 代码段，
-             *   “劈碎”成了几十甚至上百个细碎的 VMA（虚拟内存区域），并且有些页被改成了 RWX 混合权限。
-             *   这导致原本连贯的天然区段被无数个碎片彻底打乱。
-             *
-             *   攻击手段 2：远端假诱饵
-             *   反作弊会在距离真实模块上百 MB 远的极低地址（例如 0x6e32250000），
-             *   凭空 mmap() 申请一块虚假内存，并将其命名为 libil2cpp.so，权限设为 RO。
-             *   如果我们使用常规的合并算法，会误把这个极远的假地址当成模块的起始地址，
-             *   从而导致算出的 Base Address 完全错误（偏离真实基址几十上百MB），读取指针全部失效。
-             *
-             * 【第三阶段：我们的对抗算法 (六步降维打击)】
-             * 为了获取绝对精准的真实基址并完美还原天然布局，我们采用以下物理与拓扑结合的算法：
-             *
-             *   步骤 1：纯物理排序
-             *   无视所有权限和假象，直接把同名内存块按物理起始地址 (start) 绝对升序排列。
-             *
-             *   步骤 2：改进版体积聚类 (寻找生命主干)
-             *   由于 ARM64 寻址限制，真实的 .so 内存必须紧凑地挨在一起。
-             *   我们遍历内存块，一旦发现相邻块“缝隙”超过 16MB (0x1000000)，即视为“内存断层”，划分出不同群落。
-             *   累加每个群落的真实映射体积，体积最大、最丰满的群落，绝对是真实的 .so 本体！
-             *
-             *   步骤 3：物理抹杀假诱饵
-             *   锁定真实本体的 [best_base, best_end] 范围，将范围之外的所有假诱饵碎片从数组中彻底剔除。
-             *
-             *   步骤 4：严谨拓扑标记 (核心：破解权限篡改)
-             *   反作弊把代码段的权限改得乱七八糟，如何还原？我们寻找天然的“防波堤”！
-             *   先向后扫描找到第一个“纯原生数据段 (有W无X)”。在这个数据段之前的所有碎片（除了第0个Header），
-             *   无论它现在的权限是 RO 还是 RWX，它在物理拓扑上必定属于“核心代码段”！
-             *   强制将其内部拓扑标签重置为 0(RX)。跨过数据段后，则恢复原生判定，绝不越界吞噬。
-             *
-             *   步骤 5：拉链式精准缝合 (还原原生边界)
-             *   遍历洗白后的碎片，只有当相邻碎片【首尾绝对相连】且【拓扑标签一致】时，
-             *   才进行无缝拉链式融合。天然的段边界（如 RX 走到 RO）则会自然断开保留。
-             *
-             *   步骤 6：最终 Index 序列化
-             *   给缝合后的完美区段重新发放 0, 1, 2, 3... 的连续 Index（保留 BSS 的 -1）。
-             *
-             * 【最终战果】：
-             * 无论反作弊怎么切分、怎么放诱饵，跑完此算法后，产出结果与干净手机上的原生 ELF 映射 1:1 完全一致！
-             * 外部辅助只需无脑调用：Base = info->modules[X].segs[0].start，即可获取绝对真实的基址！ */
-
             std::println(stderr, " 模块 '{}' 中未找到区段索引 {}", moduleName, segmentIndex);
             return false;
         }
 
-        // 模块未找到
         std::println(stderr, " 未找到模块 '{}'", moduleName);
         return false;
-    }
 
+        // 下面已经在内核层修复了，不管了，这里只做说明，解释原理
+        /*
+         * =========================================================================================
+         * 反作弊 VMA 碎裂与诱饵对抗机制 (七步完全体)
+         * =========================================================================================
+         *
+         * 【第一阶段：理想状态下的纯净内存布局 (原生 ELF 加载)】
+         *
+         * 当 Android 原生加载一个 libil2cpp.so 时，内存布局连续且规律。
+         * 现代 64 位 Android（LLVM/Clang 编译）出于安全考虑，至少产生以下几个连续段：
+         *
+         *   PT_LOAD[0] (r--)  : ELF Header + 只读数据（.rodata、.eh_frame 等），真实基址起点。
+         *   PT_LOAD[1] (r-x)  : .text 代码段，核心逻辑所在。
+         *   PT_LOAD[2] (rw-)  : .data.rel.ro + RELRO 安全页，写完重定位后锁为只读的数据。
+         *   PT_LOAD[3] (rw-)  : .data 全局变量段。
+         *   BSS        (-w-/rw-) : 尾部额外分配的匿名读写内存（零初始化全局变量）。
+         *
+         * 即便没有反作弊，最纯净的环境也自然产生 [RO -> RX -> RW -> RW -> RW(anon)] 的天然区段。
+         *
+         * 【第二阶段：顶级反作弊的四重攻击手段】
+         *
+         *   攻击一：VMA 碎裂
+         *   反作弊高频调用 mprotect() Hook 游戏函数，内核被迫将原本一整块 RX 代码段
+         *   "劈碎"成几十甚至上百个细碎 VMA，部分页被改为 RWX 混合权限，
+         *   彻底打乱原本连贯的天然区段。
+         *
+         *   攻击二：远端假诱饵
+         *   反作弊在距离真实模块上百 MB 远的极低地址（如 0x6e32250000）凭空 mmap()
+         *   一块假内存，命名为 libil2cpp.so，权限设为 RO。
+         *   常规合并算法会误把假地址当成模块基址，导致读取指针全部失效。
+         *
+         *   攻击三：prot 权限污染
+         *   代码段内部散布着少量 RWX 碎片（反作弊自身的 trampoline hook 页）。
+         *   若在缝合阶段对权限做 OR 合并，RWX 碎片的 W 位会"传染"整个代码段，
+         *   使本该是 RX 的代码段最终呈现为 RWX，干扰上层对段类型的判断。
+         *
+         *   攻击四：BSS 权限异化
+         *   ACE 反作弊将 BSS 段的权限故意设为 -w-p（只写，无读权限）。
+         *   若 BSS 检测逻辑要求 VM_READ|VM_WRITE，则此类 BSS 完全不可见，
+         *   导致上层计算出的模块尾部地址偏短，BSS 内的全局变量无法定位。
+         *
+         * 【第三阶段：七步对抗算法 (完全体)】
+         *
+         *   步骤 1：纯物理排序
+         *   无视所有权限和假象，按物理起始地址绝对升序排列所有碎片。
+         *   应对极端的反作弊内核级乱序映射干扰。
+         *
+         *   步骤 2：改进版体积聚类 (寻找生命主干)
+         *   ARM64 寻址限制要求真实 .so 内存紧凑相连。遍历碎片，相邻块缝隙超过
+         *   16MB (0x1000000) 即视为"内存断层"，划分不同群落。
+         *   累加每个群落的真实映射体积（严防重叠映射导致体积虚高），
+         *   体积最大、最丰满的群落即为真实的 .so 本体。
+         *
+         *   步骤 3：物理抹杀假诱饵 + BSS 豁免保留
+         *   锁定真实本体的 [best_base, best_end] 范围，剔除范围外的假诱饵碎片。
+         *   豁免：index==-1 的匿名 BSS 段即便 end 超出 best_end，
+         *   只要 start 在 best_end 附近（≤ 0x3000，一个 guard 页的余量），
+         *   就视为合法的本体尾部延伸，保留并动态扩展 best_end。
+         *   这直接解决了 ACE 将 BSS 权限设为 -w-p 后尾部被误杀的问题。
+         *
+         *   步骤 4：严谨拓扑标记 (核心：破解权限篡改)
+         *   寻找天然的"防波堤"：向后扫描找到第一个"纯原生数据段 (有W无X)"。
+         *   在 Header 和第一个数据段之间的所有碎片，无论现在权限是 RO 还是 RWX，
+         *   物理拓扑上必定属于"核心代码段"，强制内部标签重置为 0(RX)。
+         *   跨过数据段后恢复原生判定，绝不越界吞噬。
+         *   内部临时标签约定：1=RO(头部), 0=RX(代码), 2=RW(数据), -1=BSS(保持不变)
+         *
+         *   步骤 4.5：强制规范化 prot (消除权限污染)
+         *   反作弊的 RWX hook 页在步骤 4 中已被正确归入代码段（index=0），
+         *   但其 W 位仍残留在 prot 字段中。
+         *   此步骤根据步骤 4 确立的权威拓扑标签，强制覆写每个碎片的 prot：
+         *     index=1(Header/RELRO) → prot=1(R)
+         *     index=0(Code)         → prot=5(RX)
+         *     index=2(Data)         → prot=3(RW)
+         *     index=-1(BSS)         → prot=3(RW)  (同时修正 -w- 的异常权限)
+         *   彻底断绝 prot 污染，使对外输出的 prot 与原生 ELF 加载完全一致。
+         *
+         *   步骤 5：拉链式精准缝合 (还原原生边界)
+         *   遍历洗白后的碎片，仅当相邻碎片【首尾绝对相连】且【拓扑标签一致】时，
+         *   进行无缝拉链式融合。天然的段边界（如 RX→RO、RO→RW）自然断开保留。
+         *   缝合时不再合并 prot（步骤 4.5 已完成规范化，此处无需再动）。
+         *
+         *   步骤 6：最终 Index 序列化
+         *   给缝合后的完美区段重新发放 0, 1, 2, 3... 的连续 Index，BSS 保留 -1。
+         *
+         * 【最终战果】：
+         * 无论反作弊怎么切分、放诱饵、异化权限，跑完此算法后，
+         * 产出结果与干净手机上的原生 ELF 映射 1:1 完全一致。
+         *
+         * 典型输出（libil2cpp.so，ACE 保护环境）：
+         *   seg[0] index=0  prot=1(R)  → PT_LOAD[0] ELF Header
+         *   seg[1] index=1  prot=5(RX) → PT_LOAD[1] .text 代码段
+         *   seg[2] index=2  prot=3(RW) → PT_LOAD[2] .data.rel.ro
+         *   seg[3] index=3  prot=1(R)  → RELRO 只读页
+         *   seg[4] index=4  prot=3(RW) → PT_LOAD[3] .data
+         *   seg[5] index=-1 prot=3(RW) → BSS (原始权限 -w-p，已被规范化)
+         *   seg[6] index=5  prot=5(RX) → PT_LOAD[4]
+         *   seg[7] index=6  prot=3(RW) → PT_LOAD[5]
+         *   seg[8] index=7  prot=3(RW) → PT_LOAD[6]
+         *
+         * 外部调用：Base = info->modules[X].segs[0].start，即可获取绝对真实基址。
+         * =========================================================================================
+         */
+    }
     // 驱动获取扫描区域
     std::vector<std::pair<uintptr_t, uintptr_t>> GetScanRegions()
     {
@@ -821,7 +878,7 @@ private: // 私有实现，外部无需关系
 
                 if (req->status <= 0)
                     return req->status;
-                memcpy((uint8_t *)buffer + processed, req->user_buffer, chunk);
+                __builtin_memcpy((uint8_t *)buffer + processed, req->user_buffer, chunk);
                 processed += chunk;
             }
             return req->status;
@@ -877,7 +934,7 @@ private: // 私有实现，外部无需关系
                 req->pid = global_pid;
                 req->target_addr = addr + processed;
                 req->size = chunk;
-                memcpy(req->user_buffer, (uint8_t *)buffer + processed, chunk);
+                __builtin_memcpy(req->user_buffer, (uint8_t *)buffer + processed, chunk);
                 IoCommitAndWait();
 
                 if (req->status <= 0)

@@ -178,7 +178,7 @@ namespace Utils
 }
 
 // ============================================================================
-// 类型定义 (Types)
+// 类型定义
 // ============================================================================
 namespace Types
 {
@@ -253,7 +253,7 @@ namespace Types
 }
 
 // ============================================================================
-// 内存工具 (Memory Utils)
+// 内存工具
 // ============================================================================
 namespace MemUtils
 {
@@ -492,7 +492,7 @@ namespace MemUtils
 }
 
 // ============================================================================
-// 内存扫描器 (Memory Scanner)
+// 内存扫描
 // ============================================================================
 class MemScanner
 {
@@ -501,76 +501,746 @@ public:
     using Values = std::vector<double>;
 
 private:
+    // 存储模式
+    enum class Mode
+    {
+        Empty,
+        Bitmap,
+        Compact
+    };
+    Mode mode_ = Mode::Empty;
+
+    // ── Compact 模式（结果少时，内存vector）──
     Results results_;
     Values lastValues_;
+
+    // ── Bitmap 模式（结果多时，1bit/地址 + mmap旧值）──
+    struct Region
+    {
+        uintptr_t start, end;
+        size_t bitOffset, bitCount;
+    };
+    std::vector<Region> regions_;
+    int bitmapFd_ = -1;
+    uint8_t *bitmapMap_ = nullptr;
+    size_t bitmapBytes_ = 0;
+    size_t totalBits_ = 0;
+    size_t setBits_ = 0;
+
+    int valuesFd_ = -1;
+    double *valuesMap_ = nullptr;
+    size_t valuesCount_ = 0;
+    size_t valueSize_ = 0;
+
+    static constexpr size_t COMPACT_THRESHOLD = 10'000'000;
+
     mutable std::shared_mutex mutex_;
     std::atomic<float> progress_{0.0f};
     std::atomic<bool> scanning_{false};
     double rangeMax_ = 0.0;
 
+    // ── mmap 辅助 ──
+    static int createTmpFd(size_t sz)
+    {
+        char tpl[] = "/tmp/memscan_XXXXXX";
+        int fd = mkstemp(tpl);
+        if (fd < 0)
+            return -1;
+        unlink(tpl);
+        if (ftruncate(fd, static_cast<off_t>(sz)) != 0)
+        {
+            close(fd);
+            return -1;
+        }
+        return fd;
+    }
+
+    static void *mapFd(int fd, size_t sz)
+    {
+        void *p = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        return p == MAP_FAILED ? nullptr : p;
+    }
+
+    void freeBitmap()
+    {
+        if (bitmapMap_)
+        {
+            munmap(bitmapMap_, bitmapBytes_);
+            bitmapMap_ = nullptr;
+        }
+        if (bitmapFd_ >= 0)
+        {
+            ::close(bitmapFd_);
+            bitmapFd_ = -1;
+        }
+        bitmapBytes_ = totalBits_ = setBits_ = 0;
+        regions_.clear();
+    }
+
+    void freeValues()
+    {
+        if (valuesMap_)
+        {
+            munmap(valuesMap_, valuesCount_ * sizeof(double));
+            valuesMap_ = nullptr;
+        }
+        if (valuesFd_ >= 0)
+        {
+            ::close(valuesFd_);
+            valuesFd_ = -1;
+        }
+        valuesCount_ = 0;
+    }
+
+    // ── Bitmap 操作 ──
+    bool getBit(size_t i) const { return (bitmapMap_[i / 8] >> (i % 8)) & 1; }
+    void setBitOn(size_t i) { bitmapMap_[i / 8] |= (1u << (i % 8)); }
+    void setBitOff(size_t i) { bitmapMap_[i / 8] &= ~(1u << (i % 8)); }
+
+    size_t addrToBit(uintptr_t addr) const
+    {
+        size_t lo = 0, hi = regions_.size();
+        while (lo < hi)
+        {
+            size_t mid = (lo + hi) / 2;
+            if (regions_[mid].end <= addr)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo >= regions_.size() || addr < regions_[lo].start)
+            return SIZE_MAX;
+        size_t off = addr - regions_[lo].start;
+        if (off % valueSize_ != 0)
+            return SIZE_MAX;
+        return regions_[lo].bitOffset + off / valueSize_;
+    }
+
+    uintptr_t bitToAddr(size_t globalBit) const
+    {
+        size_t lo = 0, hi = regions_.size();
+        while (lo < hi)
+        {
+            size_t mid = (lo + hi) / 2;
+            if (regions_[mid].bitOffset + regions_[mid].bitCount <= globalBit)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo >= regions_.size())
+            return 0;
+        return regions_[lo].start + (globalBit - regions_[lo].bitOffset) * valueSize_;
+    }
+
+    bool initBitmap(size_t valSz,
+                    const std::vector<std::pair<uintptr_t, uintptr_t>> &scanRegs,
+                    bool allSet)
+    {
+        freeBitmap();
+        freeValues();
+        valueSize_ = valSz;
+        totalBits_ = 0;
+        regions_.reserve(scanRegs.size());
+        for (auto &[s, e] : scanRegs)
+        {
+            if (e - s < valSz)
+                continue;
+            size_t bits = (e - s) / valSz;
+            regions_.push_back({s, e, totalBits_, bits});
+            totalBits_ += bits;
+        }
+        if (!totalBits_)
+            return false;
+
+        bitmapBytes_ = (totalBits_ + 7) / 8;
+        bitmapFd_ = createTmpFd(bitmapBytes_);
+        if (bitmapFd_ < 0)
+            return false;
+        bitmapMap_ = static_cast<uint8_t *>(mapFd(bitmapFd_, bitmapBytes_));
+        if (!bitmapMap_)
+        {
+            ::close(bitmapFd_);
+            bitmapFd_ = -1;
+            return false;
+        }
+
+        if (allSet)
+        {
+            std::memset(bitmapMap_, 0xFF, bitmapBytes_);
+            size_t tail = totalBits_ % 8;
+            if (tail)
+                bitmapMap_[bitmapBytes_ - 1] = static_cast<uint8_t>((1u << tail) - 1);
+            setBits_ = totalBits_;
+        }
+        else
+        {
+            std::memset(bitmapMap_, 0, bitmapBytes_);
+            setBits_ = 0;
+        }
+
+        valuesCount_ = totalBits_;
+        valuesFd_ = createTmpFd(valuesCount_ * sizeof(double));
+        if (valuesFd_ < 0)
+            return false;
+        valuesMap_ = static_cast<double *>(mapFd(valuesFd_, valuesCount_ * sizeof(double)));
+        if (!valuesMap_)
+        {
+            ::close(valuesFd_);
+            valuesFd_ = -1;
+            return false;
+        }
+        madvise(valuesMap_, valuesCount_ * sizeof(double), MADV_SEQUENTIAL);
+
+        return true;
+    }
+
+    // ── Bitmap → Compact 降级 ──
+    void bitmapToCompact()
+    {
+        results_.clear();
+        lastValues_.clear();
+        results_.reserve(setBits_);
+        lastValues_.reserve(setBits_);
+
+        for (auto &reg : regions_)
+        {
+            size_t base = reg.bitOffset;
+            size_t byteS = base / 8;
+            size_t byteE = (base + reg.bitCount + 7) / 8;
+            for (size_t b = byteS; b < byteE; ++b)
+            {
+                uint8_t byte = bitmapMap_[b];
+                if (!byte)
+                    continue;
+                for (int bit = 0; bit < 8; ++bit)
+                {
+                    if (!(byte & (1 << bit)))
+                        continue;
+                    size_t gb = b * 8 + bit;
+                    if (gb < base || gb >= base + reg.bitCount)
+                        continue;
+                    results_.push_back(bitToAddr(gb));
+                    lastValues_.push_back(valuesMap_[gb]);
+                }
+            }
+        }
+        freeBitmap();
+        freeValues();
+    }
+
+    // ── Compact 合并 ──
+    void mergeToCompact(std::vector<std::deque<uintptr_t>> &tR,
+                        std::vector<std::deque<double>> &tV, unsigned tc)
+    {
+        size_t total = 0;
+        for (unsigned i = 0; i < tc; ++i)
+            total += tR[i].size();
+
+        results_.clear();
+        lastValues_.clear();
+        results_.reserve(total);
+        lastValues_.reserve(total);
+
+        for (unsigned t = 0; t < tc; ++t)
+        {
+            results_.insert(results_.end(), tR[t].begin(), tR[t].end());
+            lastValues_.insert(lastValues_.end(), tV[t].begin(), tV[t].end());
+            std::deque<uintptr_t>().swap(tR[t]);
+            std::deque<double>().swap(tV[t]);
+        }
+    }
+
+    // ── 值处理辅助 ──
+    template <typename T>
+    static double toDouble(T value, Types::FuzzyMode mode)
+    {
+        if constexpr (std::is_integral_v<T>)
+        {
+            if (mode == Types::FuzzyMode::Pointer)
+                return static_cast<double>(MemUtils::Normalize(
+                    static_cast<uintptr_t>(static_cast<std::make_unsigned_t<T>>(value))));
+        }
+        return static_cast<double>(value);
+    }
+
+    // ================================================================
+    //  首扫 Unknown：bitmap全1 + 记录旧值到mmap
+    // ================================================================
+    template <typename T>
+    void scanFirstUnknown(pid_t pid)
+    {
+        auto scanRegs = dr.GetScanRegions();
+        if (scanRegs.empty())
+            return;
+
+        {
+            std::unique_lock lock(mutex_);
+            results_.clear();
+            results_.shrink_to_fit();
+            lastValues_.clear();
+            lastValues_.shrink_to_fit();
+            if (!initBitmap(sizeof(T), scanRegs, true))
+                return;
+            mode_ = Mode::Bitmap;
+        }
+
+        unsigned tc = std::min(static_cast<size_t>(Config::GetThreadCount()), regions_.size());
+        size_t chunk = (regions_.size() + tc - 1) / tc;
+        std::atomic<size_t> done{0};
+        std::vector<std::future<void>> futs;
+        futs.reserve(tc);
+
+        for (unsigned t = 0; t < tc; ++t)
+        {
+            futs.push_back(Utils::GlobalPool.push([&, t]
+                                                  {
+                size_t end = std::min(t * chunk + chunk, regions_.size());
+                std::vector<uint8_t> buf(Config::Constants::SCAN_BUFFER);
+                for (size_t ri = t * chunk; ri < end && Config::g_Running; ++ri)
+                {
+                    auto& reg = regions_[ri];
+                    for (uintptr_t addr = reg.start; addr < reg.end;
+                         addr += Config::Constants::SCAN_BUFFER)
+                    {
+                        size_t sz = std::min(static_cast<size_t>(reg.end - addr),
+                                             Config::Constants::SCAN_BUFFER);
+                        if (dr.Read(addr, buf.data(), sz) <= 0) continue;
+                        for (size_t off = 0; off + sizeof(T) <= sz; off += sizeof(T))
+                        {
+                            T value;
+                            std::memcpy(&value, buf.data() + off, sizeof(T));
+                            size_t gb = reg.bitOffset + (addr + off - reg.start) / sizeof(T);
+                            valuesMap_[gb] = static_cast<double>(value);
+                        }
+                    }
+                    if ((done.fetch_add(1) & 0x3F) == 0)
+                        progress_ = static_cast<float>(done) / regions_.size();
+                } }));
+        }
+        for (auto &f : futs)
+            f.get();
+    }
+
+    // ================================================================
+    //  首扫有目标值
+    // ================================================================
+    template <typename T>
+    void scanFirst(pid_t pid, T target, Types::FuzzyMode mode)
+    {
+        auto scanRegs = dr.GetScanRegions();
+        if (scanRegs.empty())
+            return;
+
+        unsigned tc = std::min(static_cast<size_t>(Config::GetThreadCount()), scanRegs.size());
+        std::vector<std::deque<uintptr_t>> tR(tc);
+        std::vector<std::deque<double>> tV(tc);
+        std::atomic<size_t> done{0};
+        size_t chunk = (scanRegs.size() + tc - 1) / tc;
+        double rmx = rangeMax_;
+
+        std::vector<std::future<void>> futs;
+        futs.reserve(tc);
+
+        for (unsigned t = 0; t < tc; ++t)
+        {
+            futs.push_back(Utils::GlobalPool.push([&, t, rmx]
+                                                  {
+                size_t end = std::min(t * chunk + chunk, scanRegs.size());
+                std::vector<uint8_t> buf(Config::Constants::SCAN_BUFFER);
+                for (size_t i = t * chunk; i < end && Config::g_Running; ++i)
+                {
+                    auto [rStart, rEnd] = scanRegs[i];
+                    if (rEnd - rStart < sizeof(T)) continue;
+                    for (uintptr_t addr = rStart; addr < rEnd;
+                         addr += Config::Constants::SCAN_BUFFER)
+                    {
+                        size_t sz = std::min(static_cast<size_t>(rEnd - addr),
+                                             Config::Constants::SCAN_BUFFER);
+                        if (dr.Read(addr, buf.data(), sz) <= 0) continue;
+                        for (size_t off = 0; off + sizeof(T) <= sz; off += sizeof(T))
+                        {
+                            T value;
+                            std::memcpy(&value, buf.data() + off, sizeof(T));
+                            if (MemUtils::Compare(value, target, mode, 0, rmx))
+                            {
+                                tR[t].push_back(MemUtils::Normalize(addr + off));
+                                tV[t].push_back(toDouble(value, mode));
+                            }
+                        }
+                    }
+                    if ((done.fetch_add(1) & 0x7F) == 0)
+                        progress_ = static_cast<float>(done) / scanRegs.size();
+                } }));
+        }
+        for (auto &f : futs)
+            f.get();
+
+        size_t totalFound = 0;
+        for (unsigned t = 0; t < tc; ++t)
+            totalFound += tR[t].size();
+
+        std::unique_lock lock(mutex_);
+        freeBitmap();
+        freeValues();
+
+        if (totalFound > COMPACT_THRESHOLD)
+        {
+            // 大结果集 → Bitmap
+            if (initBitmap(sizeof(T), scanRegs, false))
+            {
+                for (unsigned t = 0; t < tc; ++t)
+                {
+                    for (size_t i = 0; i < tR[t].size(); ++i)
+                    {
+                        size_t gb = addrToBit(tR[t][i]);
+                        if (gb != SIZE_MAX)
+                        {
+                            setBitOn(gb);
+                            valuesMap_[gb] = tV[t][i];
+                        }
+                    }
+                    std::deque<uintptr_t>().swap(tR[t]);
+                    std::deque<double>().swap(tV[t]);
+                }
+                setBits_ = totalFound;
+                mode_ = Mode::Bitmap;
+            }
+            else
+            {
+                mergeToCompact(tR, tV, tc);
+                mode_ = Mode::Compact;
+            }
+        }
+        else
+        {
+            mergeToCompact(tR, tV, tc);
+            mode_ = Mode::Compact;
+        }
+    }
+
+    // ================================================================
+    //  二次扫描 Bitmap 模式
+    // ================================================================
+    template <typename T>
+    void scanNextBitmap(T target, Types::FuzzyMode mode)
+    {
+        unsigned tc = std::min(static_cast<size_t>(Config::GetThreadCount()), regions_.size());
+        size_t chunk = (regions_.size() + tc - 1) / tc;
+        double rmx = rangeMax_;
+
+        std::atomic<size_t> done{0};
+        std::atomic<size_t> survived{0};
+
+        // 每线程收集存活结果（用于可能的降级）
+        struct TLocal
+        {
+            std::deque<uintptr_t> addrs;
+            std::deque<double> vals;
+        };
+        std::vector<TLocal> tl(tc);
+        std::vector<std::future<void>> futs;
+        futs.reserve(tc);
+
+        for (unsigned t = 0; t < tc; ++t)
+        {
+            futs.push_back(Utils::GlobalPool.push([&, t, rmx]
+                                                  {
+                size_t end = std::min(t * chunk + chunk, regions_.size());
+                std::vector<uint8_t> buf(Config::Constants::SCAN_BUFFER);
+
+                for (size_t ri = t * chunk; ri < end && Config::g_Running; ++ri)
+                {
+                    auto& reg = regions_[ri];
+                    for (uintptr_t addr = reg.start; addr < reg.end;
+                         addr += Config::Constants::SCAN_BUFFER)
+                    {
+                        size_t sz = std::min(static_cast<size_t>(reg.end - addr),
+                                             Config::Constants::SCAN_BUFFER);
+                        if (dr.Read(addr, buf.data(), sz) <= 0) continue;
+
+                        for (size_t off = 0; off + sizeof(T) <= sz; off += sizeof(T))
+                        {
+                            size_t gb = reg.bitOffset + (addr + off - reg.start) / sizeof(T);
+                            if (!getBit(gb)) continue;
+
+                            T value;
+                            std::memcpy(&value, buf.data() + off, sizeof(T));
+                            double oldVal = valuesMap_[gb];
+
+                            if (MemUtils::Compare(value, target, mode, oldVal, rmx))
+                            {
+                                double nv = toDouble(value, mode);
+                                valuesMap_[gb] = nv;
+                                survived.fetch_add(1, std::memory_order_relaxed);
+                                tl[t].addrs.push_back(MemUtils::Normalize(addr + off));
+                                tl[t].vals.push_back(nv);
+                            }
+                            else
+                            {
+                                setBitOff(gb);
+                            }
+                        }
+                    }
+                    if ((done.fetch_add(1) & 0x3F) == 0)
+                        progress_ = static_cast<float>(done) / regions_.size();
+                } }));
+        }
+        for (auto &f : futs)
+            f.get();
+
+        size_t surv = survived.load();
+
+        std::unique_lock lock(mutex_);
+        setBits_ = surv;
+
+        if (surv <= COMPACT_THRESHOLD)
+        {
+            // 降级为 Compact
+            results_.clear();
+            lastValues_.clear();
+            results_.reserve(surv);
+            lastValues_.reserve(surv);
+
+            for (unsigned t = 0; t < tc; ++t)
+            {
+                results_.insert(results_.end(), tl[t].addrs.begin(), tl[t].addrs.end());
+                lastValues_.insert(lastValues_.end(), tl[t].vals.begin(), tl[t].vals.end());
+            }
+
+            // 多线程结果需要排序
+            if (results_.size() > 1)
+            {
+                std::vector<size_t> idx(results_.size());
+                std::iota(idx.begin(), idx.end(), 0);
+                std::sort(idx.begin(), idx.end(),
+                          [&](size_t a, size_t b)
+                          { return results_[a] < results_[b]; });
+                Results sR(results_.size());
+                Values sV(lastValues_.size());
+                for (size_t i = 0; i < idx.size(); ++i)
+                {
+                    sR[i] = results_[idx[i]];
+                    sV[i] = lastValues_[idx[i]];
+                }
+                results_ = std::move(sR);
+                lastValues_ = std::move(sV);
+            }
+
+            freeBitmap();
+            freeValues();
+            mode_ = Mode::Compact;
+        }
+    }
+
+    // ================================================================
+    //  二次扫描 Compact 模式
+    // ================================================================
+    template <typename T>
+    void scanNextCompact(T target, Types::FuzzyMode mode)
+    {
+        Results oldR;
+        Values oldV;
+        {
+            std::unique_lock lock(mutex_);
+            if (results_.empty())
+                return;
+            oldR = std::move(results_);
+            oldV = std::move(lastValues_);
+        }
+
+        size_t total = oldR.size();
+        unsigned tc = Config::GetThreadCount();
+        size_t chunk = (total + tc - 1) / tc;
+        double rmx = rangeMax_;
+
+        std::vector<std::deque<uintptr_t>> tR(tc);
+        std::vector<std::deque<double>> tV(tc);
+        std::atomic<size_t> done{0};
+        std::vector<std::future<void>> futs;
+
+        for (unsigned t = 0; t < tc; ++t)
+        {
+            futs.push_back(Utils::GlobalPool.push([&, t, rmx]
+                                                  {
+                size_t start = t * chunk;
+                size_t end = std::min(start + chunk, total);
+                if (start >= end) return;
+                std::vector<uint8_t> buffer;
+
+                for (size_t i = start; i < end && Config::g_Running;)
+                {
+                    uintptr_t batchStart = oldR[i];
+                    size_t j = i + 1;
+                    while (j < end
+                        && oldR[j] - oldR[j-1] <= Config::Constants::MAX_READ_GAP
+                        && oldR[j] - batchStart + sizeof(T) <= Config::Constants::BATCH_SIZE)
+                        ++j;
+
+                    size_t bytes = (oldR[j-1] - batchStart) + sizeof(T);
+                    buffer.resize(bytes);
+                    if (dr.Read(batchStart, buffer.data(), bytes))
+                    {
+                        for (size_t k = i; k < j; ++k)
+                        {
+                            T value;
+                            std::memcpy(&value,
+                                buffer.data() + (oldR[k] - batchStart), sizeof(T));
+                            if (MemUtils::Compare(value, target, mode, oldV[k], rmx))
+                            {
+                                tR[t].push_back(oldR[k]);
+                                tV[t].push_back(toDouble(value, mode));
+                            }
+                        }
+                    }
+                    done += (j - i);
+                    i = j;
+                    if (t == 0) progress_ = static_cast<float>(done) / total;
+                } }));
+        }
+        for (auto &f : futs)
+            f.get();
+
+        std::unique_lock lock(mutex_);
+        mergeToCompact(tR, tV, tc);
+        mode_ = Mode::Compact;
+    }
+
 public:
+    MemScanner() = default;
+    ~MemScanner()
+    {
+        freeBitmap();
+        freeValues();
+    }
+    MemScanner(const MemScanner &) = delete;
+    MemScanner &operator=(const MemScanner &) = delete;
+
     bool isScanning() const noexcept { return scanning_; }
     float progress() const noexcept { return progress_; }
 
     size_t count() const
     {
         std::shared_lock lock(mutex_);
-        return results_.size();
+        return mode_ == Mode::Bitmap ? setBits_ : results_.size();
     }
 
     Results getPage(size_t start, size_t cnt) const
     {
         std::shared_lock lock(mutex_);
+        if (mode_ == Mode::Bitmap)
+        {
+            Results r;
+            r.reserve(cnt);
+            size_t found = 0, skipped = 0;
+            for (auto &reg : regions_)
+            {
+                if (found >= cnt)
+                    break;
+                size_t byteS = reg.bitOffset / 8;
+                size_t byteE = (reg.bitOffset + reg.bitCount + 7) / 8;
+                for (size_t b = byteS; b < byteE && found < cnt; ++b)
+                {
+                    uint8_t byte = bitmapMap_[b];
+                    if (!byte)
+                        continue;
+                    for (int bit = 0; bit < 8 && found < cnt; ++bit)
+                    {
+                        if (!(byte & (1 << bit)))
+                            continue;
+                        size_t gb = b * 8 + bit;
+                        if (gb < reg.bitOffset || gb >= reg.bitOffset + reg.bitCount)
+                            continue;
+                        if (skipped < start)
+                        {
+                            ++skipped;
+                            continue;
+                        }
+                        r.push_back(bitToAddr(gb));
+                        ++found;
+                    }
+                }
+            }
+            return r;
+        }
         if (start >= results_.size())
             return {};
-        return Results(results_.begin() + start, results_.begin() + std::min(start + cnt, results_.size()));
+        size_t end = std::min(start + cnt, results_.size());
+        return Results(results_.begin() + start, results_.begin() + end);
     }
-
     void clear()
     {
         std::unique_lock lock(mutex_);
         results_.clear();
+        results_.shrink_to_fit();
         lastValues_.clear();
+        lastValues_.shrink_to_fit();
+        freeBitmap();
+        freeValues();
+        mode_ = Mode::Empty;
     }
 
     void remove(uintptr_t addr)
     {
         std::unique_lock lock(mutex_);
-        auto it = std::ranges::lower_bound(results_, addr);
-        if (it != results_.end() && *it == addr)
+        if (mode_ == Mode::Compact)
         {
-            auto idx = std::distance(results_.begin(), it);
-            results_.erase(it);
-            if (static_cast<size_t>(idx) < lastValues_.size())
-                lastValues_.erase(lastValues_.begin() + idx);
+            auto it = std::ranges::lower_bound(results_, addr);
+            if (it != results_.end() && *it == addr)
+            {
+                auto idx = std::distance(results_.begin(), it);
+                results_.erase(it);
+                if (static_cast<size_t>(idx) < lastValues_.size())
+                    lastValues_.erase(lastValues_.begin() + idx);
+            }
+        }
+        else if (mode_ == Mode::Bitmap)
+        {
+            size_t gb = addrToBit(addr);
+            if (gb != SIZE_MAX && getBit(gb))
+            {
+                setBitOff(gb);
+                --setBits_;
+            }
         }
     }
 
     void add(uintptr_t addr)
     {
         std::unique_lock lock(mutex_);
-        auto it = std::ranges::lower_bound(results_, addr);
-        if (it == results_.end() || *it != addr)
+        if (mode_ == Mode::Compact)
         {
-            auto idx = std::distance(results_.begin(), it);
-            results_.insert(it, addr);
-            lastValues_.insert(lastValues_.begin() + idx, 0.0);
+            auto it = std::ranges::lower_bound(results_, addr);
+            if (it == results_.end() || *it != addr)
+            {
+                auto idx = std::distance(results_.begin(), it);
+                results_.insert(it, addr);
+                lastValues_.insert(lastValues_.begin() + idx, 0.0);
+            }
+        }
+        else if (mode_ == Mode::Bitmap)
+        {
+            size_t gb = addrToBit(addr);
+            if (gb != SIZE_MAX && !getBit(gb))
+            {
+                setBitOn(gb);
+                ++setBits_;
+            }
         }
     }
 
     void applyOffset(int64_t offset)
     {
         std::unique_lock lock(mutex_);
+        if (mode_ != Mode::Compact)
+            return;
+
         std::vector<size_t> idx(results_.size());
         std::iota(idx.begin(), idx.end(), 0);
-
         for (auto &a : results_)
             a = offset > 0 ? a + static_cast<uintptr_t>(offset)
                            : a - static_cast<uintptr_t>(-offset);
-
         std::ranges::sort(idx, {}, [&](size_t i)
                           { return results_[i]; });
-
         Results newR(results_.size());
         Values newV(lastValues_.size());
         for (size_t i = 0; i < idx.size(); ++i)
@@ -603,180 +1273,24 @@ public:
         rangeMax_ = rangeMax;
 
         if (isFirst)
-            scanFirst<T>(pid, target, mode);
+        {
+            if (mode == Types::FuzzyMode::Unknown)
+                scanFirstUnknown<T>(pid);
+            else
+                scanFirst<T>(pid, target, mode);
+        }
         else
-            scanNext<T>(target, mode);
-    }
-
-private:
-    template <typename T>
-    void scanFirst(pid_t pid, T target, Types::FuzzyMode mode)
-    {
-        auto regions = dr.GetScanRegions();
-        if (regions.empty())
-            return;
-
-        unsigned tc = std::min(static_cast<size_t>(Config::GetThreadCount()), regions.size());
-        std::vector<Results> tR(tc);
-        std::vector<Values> tV(tc);
-        std::atomic<size_t> done{0};
-        size_t chunk = (regions.size() + tc - 1) / tc;
-        double rmx = rangeMax_;
-
-        std::vector<std::future<void>> futs;
-        futs.reserve(tc);
-
-        for (unsigned t = 0; t < tc; ++t)
         {
-            futs.push_back(Utils::GlobalPool.push([&, t, rmx]
-                                                  {
-        size_t end = std::min(t * chunk + chunk, regions.size());
-        tR[t].reserve(100000);
-        tV[t].reserve(100000);
-        std::vector<uint8_t> buf(Config::Constants::SCAN_BUFFER);
-
-        for (size_t i = t * chunk; i < end && Config::g_Running; ++i) {
-            auto [rStart, rEnd] = regions[i];
-            if (rEnd - rStart < sizeof(T)) continue;
-
-            for (uintptr_t addr = rStart; addr < rEnd; addr += Config::Constants::SCAN_BUFFER) {
-                size_t sz = std::min(static_cast<size_t>(rEnd - addr),
-                                     Config::Constants::SCAN_BUFFER);
-                if (dr.Read(addr, buf.data(), sz) <=0) continue;
-
-                for (size_t off = 0; off + sizeof(T) <= sz; off += sizeof(T)) {
-                    T value;
-                    std::memcpy(&value, buf.data() + off, sizeof(T));
-                    if (mode == Types::FuzzyMode::Unknown ||
-                        MemUtils::Compare(value, target, mode, 0, rmx)) {
-                        tR[t].push_back(MemUtils::Normalize(addr + off));
-                        
-                        // 指针模式存储归一化后的值（只对整数类型有效）
-                        if constexpr (std::is_integral_v<T>) {
-                            if (mode == Types::FuzzyMode::Pointer) {
-                                uintptr_t normalizedVal = MemUtils::Normalize(
-                                    static_cast<uintptr_t>(static_cast<std::make_unsigned_t<T>>(value)));
-                                tV[t].push_back(static_cast<double>(normalizedVal));
-                            } else {
-                                tV[t].push_back(static_cast<double>(value));
-                            }
-                        } else {
-                            tV[t].push_back(static_cast<double>(value));
-                        }
-                    }
-                }
-            }
-            if ((done.fetch_add(1) & 0x7F) == 0)
-                progress_ = static_cast<float>(done) / regions.size();
-        } }));
-        }
-
-        for (auto &f : futs)
-            f.get();
-        mergeResults(tR, tV, tc);
-    }
-    template <typename T>
-    void scanNext(T target, Types::FuzzyMode mode)
-    {
-        Results oldResults;
-        Values oldValues;
-        {
-            std::unique_lock lock(mutex_);
-            if (results_.empty())
-                return;
-            oldResults = std::move(results_);
-            oldValues = std::move(lastValues_);
-        }
-
-        unsigned threadCount = Config::GetThreadCount();
-        size_t total = oldResults.size();
-        size_t chunk = (total + threadCount - 1) / threadCount;
-
-        std::vector<Results> threadResults(threadCount);
-        std::vector<Values> threadValues(threadCount);
-        std::vector<std::future<void>> futures;
-        std::atomic<size_t> done{0};
-        double rangeMax = rangeMax_;
-
-        for (unsigned t = 0; t < threadCount; ++t)
-        {
-            futures.push_back(Utils::GlobalPool.push([&, t, rangeMax]
-                                                     {
-        size_t start = t * chunk;
-        size_t end = std::min(start + chunk, total);
-        if (start >= end) return;
-        threadResults[t].reserve((end - start) / 3);
-        threadValues[t].reserve((end - start) / 3);
-        std::vector<uint8_t> buffer;
-
-        for (size_t i = start; i < end && Config::g_Running;) {
-            uintptr_t batchStart = oldResults[i];
-            size_t j = i + 1;
-            while (j < end
-                && oldResults[j] - oldResults[j-1] <= Config::Constants::MAX_READ_GAP
-                && oldResults[j] - batchStart + sizeof(T) <= Config::Constants::BATCH_SIZE)
-                ++j;
-
-            size_t bytes = (oldResults[j-1] - batchStart) + sizeof(T);
-            buffer.resize(bytes);
-            if (dr.Read(batchStart, buffer.data(), bytes)) {
-                for (size_t k = i; k < j; ++k) {
-                    T value = *reinterpret_cast<T*>(buffer.data() + (oldResults[k] - batchStart));
-                    if (MemUtils::Compare(value, target, mode, oldValues[k], rangeMax)) {
-                        threadResults[t].push_back(oldResults[k]);
-                        
-                        // 指针模式存储归一化后的值（只对整数类型有效）
-                        if constexpr (std::is_integral_v<T>) {
-                            if (mode == Types::FuzzyMode::Pointer) {
-                                uintptr_t normalizedVal = MemUtils::Normalize(
-                                    static_cast<uintptr_t>(static_cast<std::make_unsigned_t<T>>(value)));
-                                threadValues[t].push_back(static_cast<double>(normalizedVal));
-                            } else {
-                                threadValues[t].push_back(static_cast<double>(value));
-                            }
-                        } else {
-                            threadValues[t].push_back(static_cast<double>(value));
-                        }
-                    }
-                }
-            }
-            done += (j - i);
-            i = j;
-            if (t == 0)
-                progress_ = static_cast<float>(done) / total;
-        } }));
-        }
-
-        for (auto &f : futures)
-            f.get();
-        mergeResults(threadResults, threadValues, threadCount);
-    }
-    void mergeResults(std::vector<Results> &threadResults, std::vector<Values> &threadValues, unsigned threadCount)
-    {
-        size_t total = 0;
-        std::vector<size_t> offsets(threadCount);
-        for (size_t i = 0; i < threadCount; ++i)
-        {
-            offsets[i] = total;
-            total += threadResults[i].size();
-        }
-
-        std::unique_lock lock(mutex_);
-        results_.resize(total);
-        lastValues_.resize(total);
-
-        for (unsigned t = 0; t < threadCount; ++t)
-        {
-            if (threadResults[t].empty())
-                continue;
-            std::ranges::copy(threadResults[t], results_.begin() + offsets[t]);
-            std::ranges::copy(threadValues[t], lastValues_.begin() + offsets[t]);
+            if (mode_ == Mode::Bitmap)
+                scanNextBitmap<T>(target, mode);
+            else
+                scanNextCompact<T>(target, mode);
         }
     }
 };
 
 // ============================================================================
-// 指针管理器 (Pointer Scanner)
+// 指针管理器
 // ============================================================================
 class PointerManager
 {
@@ -2005,7 +2519,7 @@ public:
 };
 
 // ============================================================================
-// 锁定管理器 (Lock Manager)
+// 锁定管理器
 // ============================================================================
 class LockManager
 {
@@ -2103,7 +2617,7 @@ public:
 };
 
 // ============================================================================
-// 内存浏览器 (Memory Viewer)
+// 内存浏览器
 // ============================================================================
 class MemViewer
 {
@@ -2262,7 +2776,7 @@ public:
 };
 
 // ============================================================================
-// 布局构建器 - 核心抽象层
+// 布局构建器
 // ============================================================================
 namespace UI
 {
