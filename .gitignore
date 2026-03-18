@@ -12,3 +12,39 @@
 
 # 忽略 VS Code 配置
 .vscode/
+# Android-LS build outputs
+Android-LS/obj/
+Android-LS/libs/
+Android-LS/libomp.a
+Android-LS/libomp.so
+
+# Build dependency files
+*.o.d
+*.d
+
+# VS Code settings in subdirectories
+**/.vscode/
+
+# Android Studio / Gradle / NDK outputs
+.gradle/
+.idea/
+*.iml
+local.properties
+build/
+out/
+captures/
+.cxx/
+.externalNativeBuild/
+
+# Common generated archives and packages
+*.apk
+*.aab
+*.aar
+
+# Common OS junk
+.DS_Store
+Thumbs.db
+
+# Android-LS root-level binaries
+Android-LS/*.a
+Android-LS/*.so

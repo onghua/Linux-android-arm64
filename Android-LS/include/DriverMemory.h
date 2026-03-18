@@ -644,6 +644,16 @@ public: // 外部获取内存信息
         return regions;
     }
 
+    /*
+    问题1:
+    壳代码会通过 mmap 申请一块匿名内存（Anonymous Memory，分配时没有关联具体的文件路径）。
+    壳将真正加密的核心代码、甚至整个原始的 .so 解密释放到这块匿名内存中，并赋予 PROT_EXEC (可执行) 权限。
+    然后改变程序执行流，跳转到这块匿名内存中去执行。
+    现象： 在调试器看，PC寄存器跑飞到了一个没有名字的内存段。它往往就紧挨着当前模块的最后一个段（通常是 .bss 段）之后被分配出来。
+    问题2:
+    有些大厂或恶意软件不使用系统自带的 dlopen 加载核心模块，而是自己写了一套 Linker。直接从内存或网络读取一段字节流，然后手动 mmap 一块内存，自己做符号解析和重定位。
+    这种情况下，加载进来的核心代码在 /proc/pid/maps 中完全没有文件路径，自然也不属于任何已知模块。
+    */
     bool DumpModule(std::string_view moduleName)
     {
 
@@ -973,6 +983,10 @@ private: // 私有实现，外部无需关系
     // 读写
     int KReadProcessMemory(uint64_t addr, void *buffer, size_t size)
     {
+
+        // access_process_vm 会触发缺页，强制分配物理页
+        // access_process_vm(task, addr, buf, len, FOLL_FORCE | FOLL_REMOTE);
+
         std::scoped_lock<SpinLock> lock(m_mutex);
 
         // 大数据自动分片，防止缓冲区溢出覆盖触摸数据

@@ -1,5 +1,6 @@
 ./obj/local/arm64-v8a/objs/LS_KTool/src/main.o: src/main.cpp \
-  include/DriverMemory.h include/Android_draw/draw.h \
+  include/ThreadPool.h include/DriverMemory.h \
+  include/Android_draw/draw.h \
   include/native_surface/ANativeWindowCreator.h include/ImGui/imgui.h \
   include/ImGui/imconfig.h include/ImGui/font/Font.h \
   include/ImGui/imgui_internal.h \
@@ -34,6 +35,7 @@
   include/../capstone/include/capstone/loongarch.h \
   include/../capstone/include/capstone/xtensa.h \
   include/../capstone/include/capstone/arc.h
+include/ThreadPool.h:
 include/DriverMemory.h:
 include/Android_draw/draw.h:
 include/native_surface/ANativeWindowCreator.h:

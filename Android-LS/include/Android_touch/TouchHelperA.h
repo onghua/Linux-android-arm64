@@ -4,19 +4,19 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <pthread.h>
 #include <cmath>
 #include <linux/input.h>
 #include <linux/uinput.h>
 #include <poll.h> // 引入 poll 机制
 #include "ImGui/imgui.h"
-#include <thread>
 #include <atomic>
+#include <future>
 #include <vector>
 #include <mutex>
 #include <string.h>
 #include <errno.h>
 #include <algorithm>
+#include "ThreadPool.h"
 
 #define MAX_DEVICES 5
 #define MAX_FINGERS 10
@@ -42,7 +42,7 @@ struct DeviceConfig
     int maxX;
     int maxY;
     int deviceFd;
-    pthread_t thread;
+    std::future<void> task;
 };
 
 // 全局变量
@@ -72,9 +72,8 @@ static bool isMultiTouchDevice(int fd, const char *device_path)
 }
 
 // 触摸事件处理线程
-static void *deviceHandlerThread(void *arg)
+static void deviceHandlerThread(DeviceConfig *config)
 {
-    DeviceConfig *config = static_cast<DeviceConfig *>(arg);
     int deviceIndex = config->deviceIndex;
     int fd = config->deviceFd;
 
@@ -194,7 +193,6 @@ static void *deviceHandlerThread(void *arg)
         }
     }
     close(fd);
-    return nullptr;
 }
 
 // 需在你的主循环中调用 (ImGui::NewFrame 之前)
@@ -290,6 +288,8 @@ bool Touch_Init()
         close(found_devices[i].fd);
     found_devices.resize(1);
 
+    Touch_initialized.store(true, std::memory_order_release);
+
     for (const auto &dev_info : found_devices)
     {
         if (devices.size() >= MAX_DEVICES)
@@ -305,10 +305,9 @@ bool Touch_Init()
         config_ref.maxX = dev_info.maxX;
         config_ref.maxY = dev_info.maxY;
 
-        pthread_create(&config_ref.thread, NULL, deviceHandlerThread, &config_ref);
+        config_ref.task = Utils::GlobalPool.push([config = &config_ref]
+                                                 { deviceHandlerThread(config); });
     }
-
-    Touch_initialized.store(true, std::memory_order_release);
     return true;
 }
 
@@ -355,8 +354,7 @@ void Touch_Shutdown()
     Touch_initialized.store(false, std::memory_order_release);
 
     for (size_t i = 0; i < devices.size(); ++i)
-    {
-        pthread_join(devices[i].thread, nullptr);
-    }
+        if (devices[i].task.valid())
+            devices[i].task.wait();
     devices.clear();
 }
