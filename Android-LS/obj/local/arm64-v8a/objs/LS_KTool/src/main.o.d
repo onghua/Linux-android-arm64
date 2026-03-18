@@ -33,7 +33,8 @@
   include/../capstone/include/capstone/hppa.h \
   include/../capstone/include/capstone/loongarch.h \
   include/../capstone/include/capstone/xtensa.h \
-  include/../capstone/include/capstone/arc.h
+  include/../capstone/include/capstone/arc.h \
+  include/PerformanceTestMain.h
 include/DriverMemory.h:
 include/Android_draw/draw.h:
 include/native_surface/ANativeWindowCreator.h:
@@ -74,3 +75,4 @@ include/../capstone/include/capstone/hppa.h:
 include/../capstone/include/capstone/loongarch.h:
 include/../capstone/include/capstone/xtensa.h:
 include/../capstone/include/capstone/arc.h:
+include/PerformanceTestMain.h:
