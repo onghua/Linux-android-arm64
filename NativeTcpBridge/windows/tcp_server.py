@@ -409,6 +409,14 @@ class AndroidBridgeClient:
             timeout_seconds=float(timeout_seconds),
         )
         self._max_response_bytes = int(max_response_bytes)
+        self._session: AndroidBridgeSession | None = None
+        self._session_endpoint: tuple[str, int, float] | None = None
+
+    def _close_session_locked(self) -> None:
+        if self._session is not None:
+            self._session.disconnect()
+        self._session = None
+        self._session_endpoint = None
 
     def configure(
         self,
@@ -418,18 +426,24 @@ class AndroidBridgeClient:
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         with self._lock:
+            should_reset_session = False
             if host is not None:
                 self._config.host = normalize_bridge_host(host)
                 self._config.last_connected_host = ""
                 self._config.last_discovered_devices = []
+                should_reset_session = True
             if port is not None:
                 if port <= 0 or port > 65535:
                     raise ValueError("port must be in 1..65535")
                 self._config.port = int(port)
+                should_reset_session = True
             if timeout_seconds is not None:
                 if timeout_seconds <= 0:
                     raise ValueError("timeout_seconds must be > 0")
                 self._config.timeout_seconds = float(timeout_seconds)
+                should_reset_session = True
+            if should_reset_session:
+                self._close_session_locked()
             snapshot = asdict(self._config)
             snapshot["last_discovered_devices"] = [device.to_dict() for device in self._config.last_discovered_devices]
             snapshot["auto_discover"] = is_auto_bridge_host(self._config.host)
@@ -683,36 +697,37 @@ class AndroidBridgeClient:
         fallback_operation: str,
         configured_host: str,
     ) -> BridgeResponse:
-        with socket.create_connection((host, port), timeout=timeout_seconds) as sock:
-            sock.settimeout(timeout_seconds)
-            request_text = json.dumps(request, ensure_ascii=False) + "\n"
-            sock.sendall(request_text.encode("utf-8"))
-
-            buffer = b""
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    raise BridgeConnectionError("android tcp server closed the connection before replying")
-                buffer += chunk
-                if len(buffer) > self._max_response_bytes:
-                    raise BridgeProtocolError("android tcp response is too large")
-                split_index = buffer.find(b"\n")
-                if split_index == -1:
-                    continue
-                payload = buffer[:split_index].decode("utf-8", errors="replace").strip()
-                if not payload:
-                    buffer = buffer[split_index + 1 :]
-                    continue
-                response_obj = json.loads(payload)
-                return _coerce_bridge_response(
-                    response_obj,
-                    fallback_operation=fallback_operation,
-                    connection={
-                        "host": configured_host,
-                        "resolved_host": host,
-                        "port": port,
-                        "timeout_seconds": timeout_seconds,
-                        "auto_discover": is_auto_bridge_host(configured_host),
-                        "persistent": False,
-                    },
+        endpoint = (host, int(port), float(timeout_seconds))
+        with self._lock:
+            if self._session is None or self._session_endpoint != endpoint:
+                self._close_session_locked()
+                self._session = AndroidBridgeSession(
+                    timeout_seconds=timeout_seconds,
+                    max_response_bytes=self._max_response_bytes,
                 )
+                self._session_endpoint = endpoint
+            session = self._session
+
+        if session is None:
+            raise BridgeConnectionError("bridge session initialize failed")
+
+        try:
+            if not session.is_connected():
+                session.connect(host, port)
+            response = session.request(request)
+            response.connection = {
+                "host": configured_host,
+                "resolved_host": host,
+                "port": port,
+                "timeout_seconds": timeout_seconds,
+                "auto_discover": is_auto_bridge_host(configured_host),
+                "persistent": True,
+            }
+            if not response.operation:
+                response.operation = fallback_operation
+            return response
+        except (OSError, BridgeError, json.JSONDecodeError):
+            with self._lock:
+                if self._session is session:
+                    self._close_session_locked()
+            raise

@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -17,9 +18,15 @@ if str(PROJECT_WINDOWS_DIR) not in sys.path:
 
 from tcp_server import (  # noqa: E402
     AndroidBridgeClient,
+    AndroidBridgeSession,
+    BridgeConnectionError,
+    BridgeError,
     DEFAULT_ANDROID_HOST,
     DEFAULT_ANDROID_PORT,
     DEFAULT_ANDROID_TIMEOUT_SECONDS,
+    format_address,
+    is_auto_bridge_host,
+    normalize_view_format,
 )
 
 DEFAULT_MCP_BIND_HOST = os.getenv("ANDROID_MCP_BIND_HOST", "127.0.0.1").strip() or "127.0.0.1"
@@ -32,6 +39,129 @@ bridge = AndroidBridgeClient(
     port=DEFAULT_ANDROID_PORT,
     timeout_seconds=DEFAULT_ANDROID_TIMEOUT_SECONDS,
 )
+_bridge_session_lock = threading.RLock()
+_bridge_session: AndroidBridgeSession | None = None
+_bridge_session_host = ""
+_bridge_session_port = DEFAULT_ANDROID_PORT
+_bridge_session_timeout = DEFAULT_ANDROID_TIMEOUT_SECONDS
+_bridge_session_pid: int | None = None
+
+
+def _extract_pid_from_response(payload: dict[str, Any]) -> int | None:
+    pairs = payload.get("pairs")
+    if isinstance(pairs, dict) and "pid" in pairs:
+        try:
+            return int(str(pairs.get("pid", "0")), 0)
+        except ValueError:
+            return None
+
+    data = payload.get("data")
+    if isinstance(data, dict) and "pid" in data:
+        try:
+            return int(str(data.get("pid", "0")), 0)
+        except ValueError:
+            return None
+    return None
+
+
+def _disconnect_bridge_session() -> None:
+    global _bridge_session, _bridge_session_host, _bridge_session_port, _bridge_session_timeout, _bridge_session_pid
+    with _bridge_session_lock:
+        if _bridge_session is not None:
+            _bridge_session.disconnect()
+        _bridge_session = None
+        _bridge_session_host = ""
+        _bridge_session_port = DEFAULT_ANDROID_PORT
+        _bridge_session_timeout = DEFAULT_ANDROID_TIMEOUT_SECONDS
+        _bridge_session_pid = None
+
+
+def _resolve_host_for_session(config: dict[str, Any]) -> str:
+    host = str(config.get("host", "")).strip() or "auto"
+    if not is_auto_bridge_host(host):
+        return host
+
+    resolved = str(config.get("resolved_host") or "").strip()
+    if resolved:
+        return resolved
+
+    discovered = bridge.discover()
+    candidates = discovered.get("candidates")
+    if isinstance(candidates, list):
+        for item in candidates:
+            candidate = str(item).strip()
+            if candidate:
+                return candidate
+
+    raise BridgeConnectionError("auto host discovery returned no reachable Android tcp_server")
+
+
+def _ensure_bridge_session(*, restore_pid: bool = True) -> AndroidBridgeSession:
+    global _bridge_session, _bridge_session_host, _bridge_session_port, _bridge_session_timeout, _bridge_session_pid
+    config = bridge.current_config()
+    host = _resolve_host_for_session(config)
+    port = int(config.get("port", DEFAULT_ANDROID_PORT))
+    timeout_seconds = float(config.get("timeout_seconds", DEFAULT_ANDROID_TIMEOUT_SECONDS))
+
+    with _bridge_session_lock:
+        reconnected = False
+        need_new = (
+            _bridge_session is None
+            or _bridge_session_host != host
+            or _bridge_session_port != port
+            or abs(_bridge_session_timeout - timeout_seconds) > 1e-9
+        )
+        if need_new:
+            if _bridge_session is not None:
+                _bridge_session.disconnect()
+            _bridge_session = AndroidBridgeSession(
+                timeout_seconds=timeout_seconds,
+            )
+            _bridge_session.connect(host, port)
+            _bridge_session_host = host
+            _bridge_session_port = port
+            _bridge_session_timeout = timeout_seconds
+            reconnected = True
+        elif not _bridge_session.is_connected():
+            _bridge_session.connect(host, port)
+            reconnected = True
+
+        if reconnected and restore_pid and _bridge_session_pid is not None:
+            cached_pid = _bridge_session_pid
+            try:
+                _bridge_session.call_operation("target.pid.set", {"pid": cached_pid}).require_ok()
+            except BridgeError as exc:
+                # Cached PID may be stale after target app restart; clear it to avoid blocking new binds.
+                _bridge_session_pid = None
+                raise BridgeError(
+                    f"cached pid {cached_pid} restore failed after reconnect; "
+                    "please call android_target_set_pid or android_target_attach_package again"
+                ) from exc
+        return _bridge_session
+
+
+def _call_bridge_operation(operation: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    global _bridge_session_pid
+    op = operation.strip()
+    req_params = params or {}
+    last_exc: Exception | None = None
+
+    for _ in range(2):
+        try:
+            session = _ensure_bridge_session(restore_pid=op not in {"target.pid.set", "target.attach.package"})
+            response = session.call_operation(op, req_params).require_ok().to_dict()
+            if op in {"target.pid.set", "target.attach.package", "target.pid.current"}:
+                maybe_pid = _extract_pid_from_response(response)
+                if maybe_pid is not None:
+                    _bridge_session_pid = maybe_pid
+            return response
+        except BridgeConnectionError as exc:
+            last_exc = exc
+            _disconnect_bridge_session()
+
+    if last_exc is not None:
+        raise last_exc
+    raise BridgeConnectionError(f"bridge operation failed: {op}")
 mcp = FastMCP(
     "NativeTcpBridge Android MCP",
     host=DEFAULT_MCP_BIND_HOST,
@@ -43,7 +173,13 @@ mcp = FastMCP(
 @mcp.resource("android://connection")
 def android_connection() -> dict[str, Any]:
     """Return the current Android TCP connection settings used by this MCP server."""
-    return bridge.current_config()
+    snapshot = bridge.current_config()
+    snapshot["session_connected"] = _bridge_session is not None and _bridge_session.is_connected()
+    snapshot["session_host"] = _bridge_session_host or None
+    snapshot["session_port"] = _bridge_session_port
+    snapshot["session_timeout_seconds"] = _bridge_session_timeout
+    snapshot["session_pid"] = _bridge_session_pid
+    return snapshot
 
 
 @mcp.resource("android://protocol")
@@ -52,13 +188,39 @@ def android_protocol() -> dict[str, Any]:
     return bridge.describe()
 
 
+@mcp.resource("android://guide")
+def android_guide() -> dict[str, Any]:
+    """Return minimal AI tool guide: purpose, parameters, and examples only."""
+    return _build_ai_guide_payload()
+
+
+@mcp.resource("android://tool_catalog")
+def android_tool_catalog() -> dict[str, Any]:
+    """Return minimal tool catalog: purpose, parameters, and examples only."""
+    return _build_ai_guide_payload()
+
+
 @mcp.tool()
 def configure_android_bridge(
     host: str = DEFAULT_ANDROID_HOST,
     timeout_seconds: float = DEFAULT_ANDROID_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Configure the Android tcp_server target. Use host='auto' to scan the LAN for a reachable device."""
-    return bridge.configure(host=host, timeout_seconds=timeout_seconds)
+    before = bridge.current_config()
+    snapshot = bridge.configure(host=host, timeout_seconds=timeout_seconds)
+    config_changed = (
+        str(before.get("host", "")).strip() != str(snapshot.get("host", "")).strip()
+        or int(before.get("port", DEFAULT_ANDROID_PORT)) != int(snapshot.get("port", DEFAULT_ANDROID_PORT))
+        or abs(
+            float(before.get("timeout_seconds", DEFAULT_ANDROID_TIMEOUT_SECONDS))
+            - float(snapshot.get("timeout_seconds", DEFAULT_ANDROID_TIMEOUT_SECONDS))
+        )
+        > 1e-9
+    )
+    if config_changed:
+        _disconnect_bridge_session()
+    snapshot["session_connected"] = _bridge_session is not None and _bridge_session.is_connected()
+    return snapshot
 
 
 @mcp.tool()
@@ -70,31 +232,60 @@ def discover_android_bridges() -> dict[str, Any]:
 @mcp.tool()
 def android_bridge_ping() -> dict[str, Any]:
     """Check whether the currently configured Android tcp_server is reachable."""
-    return bridge.ping()
+    return _call_bridge_operation("bridge.ping")
+
+
+@mcp.tool()
+def connect_android_bridge() -> dict[str, Any]:
+    """Actively connect and keep session/PID state across tool calls until disconnect_android_bridge is called."""
+    _ensure_bridge_session()
+    return {
+        "ok": True,
+        "operation": "bridge.connect",
+        "message": "connected",
+        "connection": {
+            "host": _bridge_session_host,
+            "port": _bridge_session_port,
+            "timeout_seconds": _bridge_session_timeout,
+            "persistent": True,
+        },
+        "pid": _bridge_session_pid,
+    }
+
+
+@mcp.tool()
+def disconnect_android_bridge() -> dict[str, Any]:
+    """Disconnect current persistent MCP bridge session. PID/session state will be reset."""
+    _disconnect_bridge_session()
+    return {
+        "ok": True,
+        "operation": "bridge.disconnect",
+        "message": "disconnected",
+    }
 
 
 @mcp.tool()
 def android_target_set_pid(pid: int) -> dict[str, Any]:
     """Bind all scan, viewer, and breakpoint operations to a known PID."""
-    return bridge.target_set_pid(pid)
+    return _call_bridge_operation("target.pid.set", {"pid": pid})
 
 
 @mcp.tool()
 def android_target_attach_package(package_name: str) -> dict[str, Any]:
     """Resolve a package name to PID and make that process the current target."""
-    return bridge.target_attach_package(package_name)
+    return _call_bridge_operation("target.attach.package", {"package_name": package_name})
 
 
 @mcp.tool()
 def android_target_current() -> dict[str, Any]:
     """Read the current target process bound inside the Android tcp_server."""
-    return bridge.target_current()
+    return _call_bridge_operation("target.pid.current")
 
 
 @mcp.tool()
 def android_memory_regions() -> dict[str, Any]:
     """Fetch the full module and memory region map for the current target process."""
-    return bridge.memory_regions()
+    return _call_bridge_operation("memory.info.full")
 
 
 @mcp.tool()
@@ -103,7 +294,10 @@ def android_module_address(module_name: str, segment_index: int = 0, which: str 
     which_token = which.strip().lower()
     if which_token not in {"start", "end"}:
         raise ValueError("which must be 'start' or 'end'")
-    return bridge.module_address(module_name, segment_index, which_token)
+    return _call_bridge_operation(
+        "module.resolve",
+        {"module_name": module_name, "segment_index": segment_index, "which": which_token},
+    )
 
 
 @mcp.tool()
@@ -118,7 +312,12 @@ def android_memory_scan_start(
     mode_token = mode.strip().lower()
     if mode_token != "unknown" and not str(value).strip():
         raise ValueError("value is required unless mode is 'unknown'")
-    return bridge.memory_scan_start(type_token, mode_token, value, range_max)
+    params: dict[str, Any] = {"value_type": type_token, "mode": mode_token}
+    if str(value).strip():
+        params["value"] = value
+    if str(range_max).strip():
+        params["range_max"] = range_max
+    return _call_bridge_operation("scan.start", params)
 
 
 @mcp.tool()
@@ -133,7 +332,12 @@ def android_memory_scan_refine(
     mode_token = mode.strip().lower()
     if mode_token != "unknown" and not str(value).strip():
         raise ValueError("value is required unless mode is 'unknown'")
-    return bridge.memory_scan_refine(type_token, mode_token, value, range_max)
+    params: dict[str, Any] = {"value_type": type_token, "mode": mode_token}
+    if str(value).strip():
+        params["value"] = value
+    if str(range_max).strip():
+        params["range_max"] = range_max
+    return _call_bridge_operation("scan.refine", params)
 
 
 @mcp.tool()
@@ -141,67 +345,101 @@ def android_memory_scan_results(start: int = 0, count: int = 100, value_type: st
     """Read one page of the current memory scan results."""
     if count <= 0 or count > 2000:
         raise ValueError("count must be in 1..2000")
-    return bridge.memory_scan_results(start, count, value_type)
+    return _call_bridge_operation(
+        "scan.page",
+        {"start": start, "count": count, "value_type": value_type.strip().lower()},
+    )
 
 
 @mcp.tool()
 def android_memory_view_open(address: int | str, view_format: str = "hex") -> dict[str, Any]:
     """Open the memory viewer at an address. Use view_format='disasm' to request disassembly instead of raw hex bytes."""
-    return bridge.memory_view_open(address, view_format)
+    return _call_bridge_operation(
+        "viewer.open",
+        {"address": format_address(address), "view_format": normalize_view_format(view_format)},
+    )
 
 
 @mcp.tool()
 def android_memory_view_move(lines: int, step: int | None = None) -> dict[str, Any]:
     """Move the current memory viewer window by lines."""
-    return bridge.memory_view_move(lines, step)
+    params: dict[str, Any] = {"lines": lines}
+    if step is not None:
+        params["step"] = step
+    return _call_bridge_operation("viewer.move", params)
 
 
 @mcp.tool()
 def android_memory_view_offset(offset: str) -> dict[str, Any]:
     """Move the current viewer base by an offset such as '+0x20' or '-0x10'."""
-    return bridge.memory_view_offset(offset)
+    return _call_bridge_operation("viewer.offset", {"offset": offset})
 
 
 @mcp.tool()
 def android_memory_view_set_format(view_format: str) -> dict[str, Any]:
     """Change the current viewer format. Use 'disasm' for disassembly, otherwise the viewer returns formatted memory values."""
-    return bridge.memory_view_set_format(view_format)
+    return _call_bridge_operation("viewer.set_format", {"view_format": normalize_view_format(view_format)})
 
 
 @mcp.tool()
 def android_memory_view_read() -> dict[str, Any]:
     """Read the current viewer snapshot. In disasm mode, the result is in data.disasm; in other modes, raw bytes remain in data.data_hex."""
-    return bridge.memory_view_read()
+    return _call_bridge_operation("viewer.snapshot")
 
 
 @mcp.tool()
 def android_breakpoint_list() -> dict[str, Any]:
     """List the current hardware breakpoint state and saved breakpoint records."""
-    return bridge.breakpoint_list()
+    return _call_bridge_operation("breakpoint.info")
 
 
 @mcp.tool()
 def android_breakpoint_set(address: int | str, bp_type: int, bp_scope: int, length: int) -> dict[str, Any]:
     """Create a hardware breakpoint on the current target process."""
-    return bridge.breakpoint_set(address, bp_type, bp_scope, length)
+    return _call_bridge_operation(
+        "breakpoint.set",
+        {
+            "address": format_address(address),
+            "bp_type": bp_type,
+            "bp_scope": bp_scope,
+            "length": length,
+        },
+    )
 
 
 @mcp.tool()
 def android_breakpoint_clear_all() -> dict[str, Any]:
     """Remove all active hardware breakpoints from the current target process."""
-    return bridge.breakpoint_clear_all()
+    return _call_bridge_operation("breakpoint.clear")
 
 
 @mcp.tool()
 def android_breakpoint_record_remove(index: int) -> dict[str, Any]:
     """Remove one saved hardware breakpoint record by index."""
-    return bridge.breakpoint_record_remove(index)
+    return _call_bridge_operation("breakpoint.record.remove", {"index": index})
 
 
 @mcp.tool()
 def android_breakpoint_record_update(index: int, field: str, value: int | str) -> dict[str, Any]:
     """Patch one field inside a saved hardware breakpoint record."""
-    return bridge.breakpoint_record_update(index, field, value)
+    normalized = f"0x{value:X}" if isinstance(value, int) else str(value).strip()
+    return _call_bridge_operation("breakpoint.record.update", {"index": index, "field": field, "value": normalized})
+
+
+@mcp.tool()
+def android_help(topic: str = "all") -> dict[str, Any]:
+    """Return minimal tool docs for AI clients. topic can be all/<tool_name>."""
+    topic_token = str(topic).strip().lower() or "all"
+    guide = _build_ai_guide_payload()
+    if topic_token == "all":
+        return guide
+    selected = [item for item in guide["tools"] if str(item.get("name", "")).lower() == topic_token]
+    if selected:
+        return {
+            "topic": "tool",
+            "tool": selected[0],
+        }
+    raise ValueError(f"unknown topic: {topic}. use all/<tool_name>")
 
 
 def _normalize_http_path(path: str) -> str:
@@ -257,87 +495,325 @@ def _format_http_endpoint(host: str, port: int, path: str) -> str:
     return f"http://{display_host}:{port}{path}"
 
 
-TOOL_META: dict[str, tuple[str, str, str]] = {
-    "configure_android_bridge": ("Bridge Setup", "Set or update the Android tcp_server host.", '{"host":"auto","timeout_seconds":8}'),
-    "discover_android_bridges": ("Bridge Setup", "Scan the LAN for Android tcp_server candidates when the host is unknown.", "{}"),
-    "android_bridge_ping": ("Bridge Setup", "Check whether the current Android TCP target is reachable.", "{}"),
-    "android_target_set_pid": ("Target Selection", "Bind the bridge to a known PID before scanning, viewing, or breakpoints.", '{"pid":1234}'),
-    "android_target_attach_package": ("Target Selection", "Resolve a package name to PID and make it the current target process.", '{"package_name":"com.example.app"}'),
-    "android_target_current": ("Target Selection", "Read the currently bound PID.", "{}"),
-    "android_memory_regions": ("Target Selection", "Fetch the full memory map so you can enumerate module base addresses.", "{}"),
-    "android_module_address": ("Target Selection", "Resolve a specific module segment start or end address directly.", '{"module_name":"libgame.so","segment_index":0,"which":"start"}'),
-    "android_memory_scan_start": ("Memory Scan", "Start a fresh memory scan.", '{"value_type":"i32","mode":"eq","value":"1234"}'),
-    "android_memory_scan_refine": ("Memory Scan", "Narrow an existing memory scan result set.", '{"value_type":"i32","mode":"eq","value":"1234"}'),
-    "android_memory_scan_results": ("Memory Scan", "Page through scan hits after a first/next scan.", '{"start":0,"count":100,"value_type":"i32"}'),
-    "android_memory_view_open": ("Memory View", "Open the memory viewer at an address. For assembly, set view_format to disasm.", '{"address":"0x12345678","view_format":"disasm"}'),
-    "android_memory_view_move": ("Memory View", "Move the current viewer window.", '{"lines":16}'),
-    "android_memory_view_offset": ("Memory View", "Move the current viewer base by a relative offset.", '{"offset":"+0x20"}'),
-    "android_memory_view_set_format": ("Memory View", "Switch the viewer between hex, integer, float, and disassembly formats.", '{"view_format":"disasm"}'),
-    "android_memory_view_read": ("Memory View", "Read the current viewer snapshot. In disasm mode, use data.disasm instead of data.data_hex.", "{}"),
-    "android_breakpoint_list": ("Breakpoints", "Inspect current hardware breakpoint state.", "{}"),
-    "android_breakpoint_set": ("Breakpoints", "Create a hardware breakpoint on the current target.", '{"address":"0x12345678","bp_type":1,"bp_scope":0,"length":4}'),
-    "android_breakpoint_clear_all": ("Breakpoints", "Remove all active hardware breakpoints.", "{}"),
-    "android_breakpoint_record_remove": ("Breakpoints", "Delete one saved hardware breakpoint record.", '{"index":0}'),
-    "android_breakpoint_record_update": ("Breakpoints", "Patch one field inside a saved hardware breakpoint record.", '{"index":0,"field":"addr","value":"0x12345678"}'),
+TOOL_META: dict[str, dict[str, Any]] = {
+    "configure_android_bridge": {
+        "group": "Bridge Setup",
+        "use_when": "Set or update the Android tcp_server host and timeout before any business operations.",
+        "example": {"host": "auto", "timeout_seconds": 8},
+        "parameter_notes": {
+            "host": "Use 'auto' to scan LAN or pass a fixed IP like '127.0.0.1' with adb forward.",
+            "timeout_seconds": "Request timeout. Increase for heavy scans (e.g. 20-60).",
+        },
+        "result_notes": "Returns effective bridge config and discovery-related fields.",
+    },
+    "discover_android_bridges": {
+        "group": "Bridge Setup",
+        "use_when": "Find candidate Android bridge hosts when the target IP is unknown.",
+        "example": {},
+        "parameter_notes": {},
+        "result_notes": "Returns candidates and current bridge state snapshot.",
+    },
+    "android_bridge_ping": {
+        "group": "Bridge Setup",
+        "use_when": "Quick connectivity check to tcp_server before invoking heavy tools.",
+        "example": {},
+        "parameter_notes": {},
+        "result_notes": "Returns pong on healthy connection.",
+    },
+    "connect_android_bridge": {
+        "group": "Bridge Setup",
+        "use_when": "Create and keep a persistent MCP->Android TCP session for stateful operations.",
+        "example": {},
+        "parameter_notes": {},
+        "result_notes": "After connected, PID and viewer state stay valid until disconnect/reconfigure.",
+    },
+    "disconnect_android_bridge": {
+        "group": "Bridge Setup",
+        "use_when": "Explicitly close persistent MCP bridge session and reset sticky PID/session state.",
+        "example": {},
+        "parameter_notes": {},
+        "result_notes": "Use before switching device/host context or to force clean reconnect.",
+    },
+    "android_target_set_pid": {
+        "group": "Target Selection",
+        "use_when": "Bind all subsequent scan/view/breakpoint operations to a known PID.",
+        "example": {"pid": 1234},
+        "parameter_notes": {"pid": "Positive process ID."},
+        "result_notes": "Global target PID is updated on Android bridge side.",
+    },
+    "android_target_attach_package": {
+        "group": "Target Selection",
+        "use_when": "Resolve package name to PID and bind that process as current target.",
+        "example": {"package_name": "com.example.app"},
+        "parameter_notes": {"package_name": "Android package name, e.g. me.hd.ggtutorial."},
+        "result_notes": "Returns resolved PID and binding result.",
+    },
+    "android_target_current": {
+        "group": "Target Selection",
+        "use_when": "Read current bound PID before a complex operation chain.",
+        "example": {},
+        "parameter_notes": {},
+        "result_notes": "Returns active PID used by scan/view/breakpoint operations.",
+    },
+    "android_memory_regions": {
+        "group": "Target Selection",
+        "use_when": "Query modules/segments/regions for address planning.",
+        "example": {},
+        "parameter_notes": {},
+        "result_notes": "Returns full memory map payload.",
+    },
+    "android_module_address": {
+        "group": "Target Selection",
+        "use_when": "Resolve one module segment boundary quickly.",
+        "example": {"module_name": "libgame.so", "segment_index": 0, "which": "start"},
+        "parameter_notes": {
+            "module_name": "Exact module path/name from android_memory_regions.",
+            "segment_index": "Zero-based segment index.",
+            "which": "Either 'start' or 'end'.",
+        },
+        "result_notes": "Returns resolved address in message/pairs.",
+    },
+    "android_memory_scan_start": {
+        "group": "Memory Scan",
+        "use_when": "Start a fresh scan task.",
+        "example": {"value_type": "i32", "mode": "eq", "value": "1234"},
+        "parameter_notes": {
+            "value_type": "i8/i16/i32/i64/f32/f64.",
+            "mode": "unknown/eq/gt/lt/inc/dec/changed/unchanged/range/pointer.",
+            "value": "Required unless mode=unknown.",
+            "range_max": "Optional range bound, used for range mode.",
+        },
+        "result_notes": "Starts (or refreshes) scanner state and returns immediate status.",
+    },
+    "android_memory_scan_refine": {
+        "group": "Memory Scan",
+        "use_when": "Refine existing scan results using new condition.",
+        "example": {"value_type": "i32", "mode": "eq", "value": "1234"},
+        "parameter_notes": {
+            "value_type": "Must match intended value interpretation.",
+            "mode": "Same token set as android_memory_scan_start.",
+            "value": "Required unless mode=unknown.",
+            "range_max": "Optional range bound.",
+        },
+        "result_notes": "Narrows previous result set.",
+    },
+    "android_memory_scan_results": {
+        "group": "Memory Scan",
+        "use_when": "Read one page of scan hits.",
+        "example": {"start": 0, "count": 100, "value_type": "i32"},
+        "parameter_notes": {
+            "start": "Offset into scan result list.",
+            "count": "1..2000 page size.",
+            "value_type": "How to render values in output.",
+        },
+        "result_notes": "Returns page items and total_count.",
+    },
+    "android_memory_view_open": {
+        "group": "Memory View",
+        "use_when": "Open viewer at address in hex/typed/disasm mode.",
+        "example": {"address": "0x12345678", "view_format": "disasm"},
+        "parameter_notes": {
+            "address": "Integer or hex string.",
+            "view_format": "hex/hex16/hex64/i8/i16/i32/i64/f32/f64/disasm.",
+        },
+        "result_notes": "Initializes viewer base and mode.",
+    },
+    "android_memory_view_move": {
+        "group": "Memory View",
+        "use_when": "Scroll current viewer window.",
+        "example": {"lines": 16},
+        "parameter_notes": {
+            "lines": "Positive/negative line offset.",
+            "step": "Optional custom byte step per line.",
+        },
+        "result_notes": "Updates viewer position.",
+    },
+    "android_memory_view_offset": {
+        "group": "Memory View",
+        "use_when": "Move viewer by relative address expression.",
+        "example": {"offset": "+0x20"},
+        "parameter_notes": {"offset": "Examples: +0x20, -0x10."},
+        "result_notes": "Applies relative shift from current base.",
+    },
+    "android_memory_view_set_format": {
+        "group": "Memory View",
+        "use_when": "Switch viewer output format.",
+        "example": {"view_format": "disasm"},
+        "parameter_notes": {"view_format": "Same set as android_memory_view_open."},
+        "result_notes": "Viewer stays at current base with new format.",
+    },
+    "android_memory_view_read": {
+        "group": "Memory View",
+        "use_when": "Read current viewer snapshot payload.",
+        "example": {},
+        "parameter_notes": {},
+        "result_notes": "In disasm mode read data.disasm; otherwise use data.data_hex.",
+    },
+    "android_breakpoint_list": {
+        "group": "Breakpoints",
+        "use_when": "Inspect active breakpoint info and saved records.",
+        "example": {},
+        "parameter_notes": {},
+        "result_notes": "records may be empty if no hit record exists.",
+    },
+    "android_breakpoint_set": {
+        "group": "Breakpoints",
+        "use_when": "Create one hardware breakpoint.",
+        "example": {"address": "0x12345678", "bp_type": 1, "bp_scope": 0, "length": 4},
+        "parameter_notes": {
+            "address": "Target instruction/data address.",
+            "bp_type": "Type enum from backend.",
+            "bp_scope": "Scope enum from backend.",
+            "length": "Byte length constraint from backend.",
+        },
+        "result_notes": "Creates breakpoint; record update requires existing record index.",
+    },
+    "android_breakpoint_clear_all": {
+        "group": "Breakpoints",
+        "use_when": "Remove all active hardware breakpoints.",
+        "example": {},
+        "parameter_notes": {},
+        "result_notes": "Clears runtime breakpoints.",
+    },
+    "android_breakpoint_record_remove": {
+        "group": "Breakpoints",
+        "use_when": "Delete one saved breakpoint record entry.",
+        "example": {"index": 0},
+        "parameter_notes": {"index": "Valid index from android_breakpoint_list.data.records."},
+        "result_notes": "Fails with index out of range when records is empty.",
+    },
+    "android_breakpoint_record_update": {
+        "group": "Breakpoints",
+        "use_when": "Patch one field in saved breakpoint record.",
+        "example": {"index": 0, "field": "addr", "value": "0x12345678"},
+        "parameter_notes": {
+            "index": "Valid existing record index.",
+            "field": "Backend-supported record field name.",
+            "value": "Number or hex string depending on field.",
+        },
+        "result_notes": "Requires non-empty records; otherwise index out of range.",
+    },
+    "android_help": {
+        "group": "Docs",
+        "use_when": "Fetch tool usage docs directly from tool channel.",
+        "example": {"topic": "android_memory_view_open"},
+        "parameter_notes": {"topic": "all/<tool_name>."},
+        "result_notes": "Returns minimal tool usage docs.",
+    },
 }
 
 
-def _format_tool_parameters(parameters: dict[str, Any] | None) -> str:
-    if not parameters:
-        return "none"
-
-    properties = parameters.get("properties", {})
-    required = set(parameters.get("required", []))
-    parts: list[str] = []
-    for name, schema in properties.items():
-        type_name = schema.get("type", "any")
-        fragment = f"{name}: {type_name}"
-        if name not in required:
-            if "default" in schema:
-                fragment += f" = {schema['default']!r}"
-            else:
-                fragment += " (optional)"
-        parts.append(fragment)
-    return ", ".join(parts) if parts else "none"
-
-
-def _build_tool_catalog() -> list[dict[str, str]]:
-    return [
+def _meta_for_tool(tool_name: str) -> dict[str, Any]:
+    return TOOL_META.get(
+        tool_name,
         {
-            "name": tool.name,
-            "description": tool.description or "",
-            "when": TOOL_META.get(tool.name, ("Bridge Setup", "Use this tool according to its description.", "{}"))[1],
-            "parameters": _format_tool_parameters(tool.parameters),
-            "example": TOOL_META.get(tool.name, ("Bridge Setup", "", "{}"))[2],
+            "group": "Bridge Setup",
+            "use_when": "Use this tool according to its description.",
+            "example": {},
+            "parameter_notes": {},
+            "result_notes": "",
+        },
+    )
+
+
+def _build_tool_parameter_docs(
+    parameters: dict[str, Any] | None,
+    parameter_notes: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
+    required = set(parameters.get("required", [])) if isinstance(parameters, dict) else set()
+    notes = parameter_notes if isinstance(parameter_notes, dict) else {}
+
+    docs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for name, schema in properties.items():
+        field_name = str(name)
+        seen.add(field_name)
+        schema_obj = schema if isinstance(schema, dict) else {}
+        item: dict[str, Any] = {
+            "name": field_name,
+            "type": str(schema_obj.get("type", "any")),
+            "required": field_name in required,
+            "description": str(notes.get(field_name) or schema_obj.get("description") or ""),
         }
-        for tool in mcp._tool_manager.list_tools()
-    ]
+        if "default" in schema_obj:
+            item["default"] = schema_obj["default"]
+        docs.append(item)
+
+    for name, note in notes.items():
+        field_name = str(name)
+        if field_name in seen:
+            continue
+        docs.append(
+            {
+                "name": field_name,
+                "type": "any",
+                "required": False,
+                "description": str(note),
+            }
+        )
+    return docs
 
 
-def _group_tool_catalog(tool_catalog: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
-    by_group: dict[str, list[dict[str, str]]] = {}
-    for tool in tool_catalog:
-        group = TOOL_META.get(tool["name"], ("Bridge Setup", "", ""))[0]
-        by_group.setdefault(group, []).append(tool)
-    return by_group
+def _build_tool_catalog() -> list[dict[str, Any]]:
+    catalog: list[dict[str, Any]] = []
+    for tool in mcp._tool_manager.list_tools():
+        meta = _meta_for_tool(tool.name)
+        parameter_notes = dict(meta.get("parameter_notes", {})) if isinstance(meta.get("parameter_notes"), dict) else {}
+        catalog.append(
+            {
+                "name": tool.name,
+                "purpose": str(meta.get("use_when", "") or tool.description or ""),
+                "parameters": _build_tool_parameter_docs(tool.parameters, parameter_notes),
+                "example": dict(meta.get("example", {})) if isinstance(meta.get("example"), dict) else meta.get("example", {}),
+            }
+        )
+    return catalog
 
 
-def _render_tool_guide(tool_catalog: list[dict[str, str]]) -> str:
+def _group_tool_catalog(tool_catalog: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    return {"Tools": list(tool_catalog)}
+
+
+def _render_tool_guide(tool_catalog: list[dict[str, Any]]) -> str:
     sections: list[str] = []
     for group_name, items in _group_tool_catalog(tool_catalog).items():
         sections.append(group_name)
         for tool in items:
+            example_text = json.dumps(tool.get("example", {}), ensure_ascii=False)
             sections.extend(
                 [
                     f"- {tool['name']}",
-                    f"  Purpose: {tool['description']}",
-                    f"  Use when: {tool['when']}",
-                    f"  Parameters: {tool['parameters']}",
-                    f"  Example args: {tool['example']}",
+                    f"  作用: {tool.get('purpose', '')}",
+                    "  参数说明:",
                 ]
             )
+            parameters = tool.get("parameters", [])
+            if isinstance(parameters, list) and parameters:
+                for field in parameters:
+                    if not isinstance(field, dict):
+                        continue
+                    name = str(field.get("name", ""))
+                    type_name = str(field.get("type", "any"))
+                    required = bool(field.get("required", False))
+                    desc = str(field.get("description", ""))
+                    fragment = f"  - {name}: type={type_name}, required={required}"
+                    if "default" in field:
+                        fragment += f", default={field['default']!r}"
+                    if desc:
+                        fragment += f", desc={desc}"
+                    sections.append(fragment)
+            else:
+                sections.append("  - 无")
+            sections.append(f"  调用示例: {example_text}")
         sections.append("")
     return "\n".join(sections).strip()
+
+
+def _build_ai_guide_payload() -> dict[str, Any]:
+    return {
+        "tools": _build_tool_catalog(),
+    }
 
 
 def _build_connection_steps(runtime: dict[str, Any]) -> str:
@@ -346,10 +822,11 @@ def _build_connection_steps(runtime: dict[str, Any]) -> str:
             "1. Connect to this MCP server using Streamable HTTP.",
             f"2. Use this URL: {runtime['streamable_http_url']}",
             "3. Initialize MCP, call tools/list, then call tools by their exact names.",
-            "4. Start with configure_android_bridge, android_bridge_ping, and android_target_attach_package.",
+            "4. Start with configure_android_bridge, connect_android_bridge, android_bridge_ping, and android_target_attach_package.",
             "5. For module base addresses use android_memory_regions or android_module_address.",
             "6. For disassembly use android_memory_view_open(view_format='disasm') and then read data.disasm from android_memory_view_read.",
-            "7. The Android bridge also exposes a structured operation protocol at android://protocol.",
+            "7. Keep the session alive for stateful operations; call disconnect_android_bridge only when you really want to reset PID/session state.",
+            "8. The Android bridge also exposes a structured operation protocol at android://protocol.",
         ]
     )
 
@@ -400,32 +877,22 @@ def _build_python_example(runtime: dict[str, Any]) -> str:
 def _build_startup_handoff(runtime: dict[str, Any]) -> str:
     return "\n".join(
         [
-            "[MCP] AI connection guide:",
-            *[f"  {line}" for line in _build_connection_steps(runtime).splitlines()],
-            "[MCP] curl initialize example:",
-            f"  {_build_curl_example(runtime)}",
-            "[MCP] python initialize example:",
-            *[f"  {line}" for line in _build_python_example(runtime).splitlines()],
+            "[MCP] AI tool usage guide:",
+            "  Resource: android://guide",
+            "  Resource: android://tool_catalog",
+            "  Tool: android_help(topic='all' or topic='<tool_name>')",
         ]
     )
 
 
 def _build_config_html(runtime: dict[str, Any]) -> str:
     tool_catalog = _build_tool_catalog()
-    try:
-        protocol_text = json.dumps(bridge.describe(), ensure_ascii=False, indent=2)
-    except Exception as exc:  # noqa: BLE001
-        protocol_text = f"unavailable: {exc}"
 
     guide_text = "\n\n".join(
         [
-            "NativeTcpBridge MCP",
-            f"MCP URL\n{runtime['streamable_http_url']}",
-            f"Connection Steps\n{_build_connection_steps(runtime)}",
-            f"curl Initialize Example\n{_build_curl_example(runtime)}",
-            f"Python Initialize Example\n{_build_python_example(runtime)}",
-            f"Bridge Protocol\n{protocol_text}",
-            f"Tools\n{_render_tool_guide(tool_catalog)}",
+            "NativeTcpBridge MCP Tool Guide",
+            "仅包含: 工具作用 / 参数说明 / 调用示例",
+            f"{_render_tool_guide(tool_catalog)}",
         ]
     )
 
