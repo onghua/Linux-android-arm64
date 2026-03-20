@@ -10,6 +10,7 @@
 #include <string_view>
 #include <vector>
 #include <unordered_set>
+#include <unordered_map>
 #include <optional>
 #include <sstream>
 #include <format>
@@ -19,6 +20,8 @@
 #include <deque>
 #include <thread>
 #include <limits>
+#include <variant>
+#include <memory>
 
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -107,6 +110,44 @@ namespace Types
     };
 
     // 编译期大小查表
+    namespace Labels
+    {
+        inline constexpr std::array<const char *, static_cast<size_t>(DataType::Count)> TYPE = {
+            "Int8",
+            "Int16",
+            "Int32",
+            "Int64",
+            "Float",
+            "Double",
+        };
+
+        inline constexpr std::array<const char *, static_cast<size_t>(FuzzyMode::Count)> FUZZY = {
+            "未知",
+            "等于",
+            "大于",
+            "小于",
+            "增加",
+            "减少",
+            "已变化",
+            "未变化",
+            "范围",
+            "指针",
+        };
+
+        inline constexpr std::array<const char *, static_cast<size_t>(ViewFormat::Count)> FORMAT = {
+            "Hex",
+            "Hex16",
+            "Hex64",
+            "Int8",
+            "Int16",
+            "Int32",
+            "Int64",
+            "Float",
+            "Double",
+            "Disasm",
+        };
+    } // namespace Labels
+
     namespace detail
     {
         constexpr std::array<size_t, 6> kDataSizes = {1, 2, 4, 8, 4, 8};
@@ -1183,7 +1224,8 @@ private:
     };
     std::list<LockItem> locks_;
     mutable std::mutex mutex_;
-    std::jthread writeThread_;
+    std::future<void> writeTask_;
+    std::atomic<bool> writeStop_{false};
 
     // 按地址查找锁定项。
     auto find(uintptr_t addr)
@@ -1193,9 +1235,9 @@ private:
     }
 
     // 后台循环写入被锁定的内存项。
-    void writeLoop(std::stop_token stoken)
+    void writeLoop()
     {
-        while (!stoken.stop_requested() && Config::g_Running)
+        while (!writeStop_.load(std::memory_order_acquire) && Config::g_Running)
         {
             {
                 std::lock_guard lock(mutex_);
@@ -1208,10 +1250,17 @@ private:
 
 public:
     LockManager()
-        : writeThread_([this](std::stop_token st)
-                       { writeLoop(st); }) {}
+    {
+        writeTask_ = Utils::GlobalPool.push_io([this]
+                                               { writeLoop(); });
+    }
 
-    ~LockManager() { writeThread_.request_stop(); }
+    ~LockManager()
+    {
+        writeStop_.store(true, std::memory_order_release);
+        if (writeTask_.valid())
+            writeTask_.wait();
+    }
 
     // 判断目标地址是否处于锁定状态。
     bool isLocked(uintptr_t addr) const
@@ -2386,7 +2435,7 @@ public:
     };
 
     // 递归校验并裁剪无效指针分支。
-    bool prune_dfs(const PtrDir &nodeA, const PtrDir &nodeB, int current_level, const MemoryGraph &GA, const MemoryGraph &GB, std::vector<std::vector<uint8_t>> &memo)
+    static bool prune_dfs(const PtrDir &nodeA, const PtrDir &nodeB, int current_level, const MemoryGraph &GA, const MemoryGraph &GB, std::vector<std::vector<uint8_t>> &memo)
     {
         // 成功触底，返回 true
         if (current_level < 0)
@@ -2435,8 +2484,8 @@ public:
     // 合并多轮扫描结果并裁剪失效链。
     void MergeBins()
     {
-        std::thread([this]()
-                    {
+        Utils::GlobalPool.post([]()
+                               {
             std::println("=== [MergeBins] 开始基于图裁剪算法的极速合并 ===");
 
             std::vector<std::string> files;
@@ -2559,8 +2608,7 @@ public:
             for (const auto& fn : files) remove(fn.c_str());
             rename("Pointer_Merged.tmp", "Pointer.bin");
 
-            std::println("图层合并结束！已成功剔除失效的指针树分支并生成 Pointer.bin"); })
-            .detach();
+            std::println("图层合并结束！已成功剔除失效的指针树分支并生成 Pointer.bin"); });
     }
 
     // 将指针链导出为可读文本。
@@ -2673,11 +2721,21 @@ namespace
     constexpr std::uint16_t kServerPort = 9494;
     constexpr int kListenBacklog = 4;
     std::atomic_bool gRunning{true};
+    std::atomic_uint64_t gClientSessionSeed{1};
     int gServerFd = -1;
-    MemScanner gMemScanner;
     LockManager gLockManager;
-    MemViewer gMemViewer;
-    PointerManager gPointerManager;
+    std::mutex gDriverCommandMutex;
+
+    struct ClientSession
+    {
+        std::uint64_t sessionId;
+        MemScanner memScanner;
+        MemViewer memViewer;
+        PointerManager pointerManager;
+
+        explicit ClientSession(std::uint64_t id)
+            : sessionId(id) {}
+    };
 
     // 打印系统错误信息
     void printErrno(std::string_view action)
@@ -3326,8 +3384,9 @@ namespace
     }
 
     // 内部文本命令派发
-    std::string DispatchTextCommand(const std::string &request)
+    std::string DispatchTextCommand(const std::shared_ptr<ClientSession> &session, const std::string &request)
     {
+        std::lock_guard<std::mutex> driverLock(gDriverCommandMutex);
         const auto tokens = splitTokens(request);
         if (tokens.empty())
         {
@@ -3666,14 +3725,14 @@ namespace
         if (command == "scan.status")
         {
             return ok(std::format("scanning={} progress={:.4f} count={}",
-                                  gMemScanner.isScanning() ? 1 : 0,
-                                  gMemScanner.progress(),
-                                  gMemScanner.count()));
+                                  session->memScanner.isScanning() ? 1 : 0,
+                                  session->memScanner.progress(),
+                                  session->memScanner.count()));
         }
 
         if (command == "scan.clear")
         {
-            gMemScanner.clear();
+            session->memScanner.clear();
             return ok("已清空扫描结果");
         }
 
@@ -3690,8 +3749,8 @@ namespace
                 return err("地址无效");
             }
 
-            gMemScanner.add(static_cast<uintptr_t>(*addr));
-            return ok(std::format("count={}", gMemScanner.count()));
+            session->memScanner.add(static_cast<uintptr_t>(*addr));
+            return ok(std::format("count={}", session->memScanner.count()));
         }
 
         if (command == "scan.remove")
@@ -3707,8 +3766,8 @@ namespace
                 return err("地址无效");
             }
 
-            gMemScanner.remove(static_cast<uintptr_t>(*addr));
-            return ok(std::format("count={}", gMemScanner.count()));
+            session->memScanner.remove(static_cast<uintptr_t>(*addr));
+            return ok(std::format("count={}", session->memScanner.count()));
         }
 
         if (command == "scan.offset")
@@ -3724,8 +3783,8 @@ namespace
                 return err("偏移参数无效");
             }
 
-            gMemScanner.applyOffset(*offset);
-            return ok(std::format("count={}", gMemScanner.count()));
+            session->memScanner.applyOffset(*offset);
+            return ok(std::format("count={}", session->memScanner.count()));
         }
 
         if (command == "scan.first" || command == "scan.next")
@@ -3798,11 +3857,11 @@ namespace
                     target = *parsedValue;
                 }
 
-                gMemScanner.scan<T>(pid, target, *fuzzyMode, isFirst, rangeMax);
+                session->memScanner.scan<T>(pid, target, *fuzzyMode, isFirst, rangeMax);
                 return ok(std::format("count={} progress={:.4f} scanning={}",
-                                      gMemScanner.count(),
-                                      gMemScanner.progress(),
-                                      gMemScanner.isScanning() ? 1 : 0)); });
+                                      session->memScanner.count(),
+                                      session->memScanner.progress(),
+                                      session->memScanner.isScanning() ? 1 : 0)); });
 
             return result;
         }
@@ -3827,12 +3886,12 @@ namespace
                 return err("count 范围 1-2000");
             }
 
-            const auto page = gMemScanner.getPage(static_cast<size_t>(*start), static_cast<size_t>(*count));
+            const auto page = session->memScanner.getPage(static_cast<size_t>(*start), static_cast<size_t>(*count));
             json payload;
             payload["start"] = *start;
             payload["request_count"] = *count;
             payload["result_count"] = page.size();
-            payload["total_count"] = gMemScanner.count();
+            payload["total_count"] = session->memScanner.count();
             payload["type"] = tokens[3];
             payload["items"] = json::array();
 
@@ -3869,14 +3928,14 @@ namespace
                 {
                     return err("format 无效，支持: hex/hex16/hex64/i8/i16/i32/i64/f32/f64/disasm");
                 }
-                gMemViewer.setFormat(*format);
+                session->memViewer.setFormat(*format);
             }
 
-            gMemViewer.open(static_cast<uintptr_t>(*address));
+            session->memViewer.open(static_cast<uintptr_t>(*address));
             return ok(std::format("base=0x{:X} format={} read={}",
-                                  static_cast<std::uint64_t>(gMemViewer.base()),
-                                  viewFormatToToken(gMemViewer.format()),
-                                  gMemViewer.readSuccess() ? 1 : 0));
+                                  static_cast<std::uint64_t>(session->memViewer.base()),
+                                  viewFormatToToken(session->memViewer.format()),
+                                  session->memViewer.readSuccess() ? 1 : 0));
         }
 
         if (command == "viewer.move")
@@ -3892,7 +3951,7 @@ namespace
                 return err("行数参数无效");
             }
 
-            std::size_t step = Types::GetViewSize(gMemViewer.format());
+            std::size_t step = Types::GetViewSize(session->memViewer.format());
             if (step == 0)
             {
                 step = 1;
@@ -3907,10 +3966,10 @@ namespace
                 step = static_cast<std::size_t>(*parsedStep);
             }
 
-            gMemViewer.move(*lines, step);
+            session->memViewer.move(*lines, step);
             return ok(std::format("base=0x{:X} read={}",
-                                  static_cast<std::uint64_t>(gMemViewer.base()),
-                                  gMemViewer.readSuccess() ? 1 : 0));
+                                  static_cast<std::uint64_t>(session->memViewer.base()),
+                                  session->memViewer.readSuccess() ? 1 : 0));
         }
 
         if (command == "viewer.offset")
@@ -3920,14 +3979,14 @@ namespace
                 return err("用法: viewer.offset <偏移，如 +0x20/-0x10>");
             }
 
-            if (!gMemViewer.applyOffset(tokens[1]))
+            if (!session->memViewer.applyOffset(tokens[1]))
             {
                 return err("偏移参数无效");
             }
 
             return ok(std::format("base=0x{:X} read={}",
-                                  static_cast<std::uint64_t>(gMemViewer.base()),
-                                  gMemViewer.readSuccess() ? 1 : 0));
+                                  static_cast<std::uint64_t>(session->memViewer.base()),
+                                  session->memViewer.readSuccess() ? 1 : 0));
         }
 
         if (command == "viewer.format")
@@ -3943,22 +4002,22 @@ namespace
                 return err("format 无效，支持: hex/hex16/hex64/i8/i16/i32/i64/f32/f64/disasm");
             }
 
-            gMemViewer.setFormat(*format);
-            return ok(std::format("format={}", viewFormatToToken(gMemViewer.format())));
+            session->memViewer.setFormat(*format);
+            return ok(std::format("format={}", viewFormatToToken(session->memViewer.format())));
         }
 
         if (command == "viewer.get")
         {
-            const std::string jsonText = buildViewerSnapshotJson(gMemViewer).dump();
+            const std::string jsonText = buildViewerSnapshotJson(session->memViewer).dump();
             return std::format("ok viewer.get size={}\n{}", jsonText.size(), jsonText);
         }
 
         if (command == "pointer.status")
         {
             return ok(std::format("scanning={} progress={:.4f} count={}",
-                                  gPointerManager.isScanning() ? 1 : 0,
-                                  gPointerManager.scanProgress(),
-                                  gPointerManager.count()));
+                                  session->pointerManager.isScanning() ? 1 : 0,
+                                  session->pointerManager.scanProgress(),
+                                  session->pointerManager.count()));
         }
 
         if (command == "pointer.scan" || command == "pointer.scan.manual" || command == "pointer.scan.array")
@@ -4031,40 +4090,37 @@ namespace
 
             const std::string filterModule = (tokens.size() > filterStart) ? joinTokens(tokens, filterStart) : "";
 
-            if (gPointerManager.isScanning())
+            if (session->pointerManager.isScanning())
             {
                 return err("当前已有指针扫描任务在运行");
             }
 
-            std::thread([pid, target = *target, depth = *depth, maxOffset = *maxOffset,
-                         useManual, manualBase, manualMaxOffset,
-                         useArray, arrayBase, arrayCount, filterModule]()
-                        { gPointerManager.scan(
-                              pid,
-                              static_cast<uintptr_t>(target),
-                              depth,
-                              maxOffset,
-                              useManual,
-                              static_cast<uintptr_t>(manualBase),
-                              manualMaxOffset,
-                              useArray,
-                              static_cast<uintptr_t>(arrayBase),
-                              arrayCount,
-                              filterModule); })
-                .detach();
+            // 串行执行指针扫描：与全局驱动请求锁配合，确保任意连接改 PID/发请求都按顺序进入。
+            session->pointerManager.scan(
+                pid,
+                static_cast<uintptr_t>(*target),
+                *depth,
+                *maxOffset,
+                useManual,
+                static_cast<uintptr_t>(manualBase),
+                manualMaxOffset,
+                useArray,
+                static_cast<uintptr_t>(arrayBase),
+                arrayCount,
+                filterModule);
 
-            return ok("started=1");
+            return ok(std::format("done=1 count={}", session->pointerManager.count()));
         }
 
         if (command == "pointer.merge")
         {
-            gPointerManager.MergeBins();
+            session->pointerManager.MergeBins();
             return ok("started=1");
         }
 
         if (command == "pointer.export")
         {
-            gPointerManager.ExportToTxt();
+            session->pointerManager.ExportToTxt();
             return ok("done=1");
         }
 
@@ -4479,8 +4535,581 @@ namespace
         return out;
     }
 
+    json makeProtocolError(std::string_view message, std::string_view operation = {})
+    {
+        json out = {
+            {"ok", false},
+            {"error", std::string(message)},
+        };
+        if (!operation.empty())
+        {
+            out["operation"] = std::string(operation);
+        }
+        return out;
+    }
+
+    std::optional<std::string> getRequiredStringParam(const json &params, std::string_view key)
+    {
+        const auto it = params.find(std::string(key));
+        if (it == params.end())
+        {
+            return std::nullopt;
+        }
+
+        if (it->is_string())
+        {
+            return it->get<std::string>();
+        }
+
+        if (it->is_boolean() || it->is_number_integer() || it->is_number_unsigned() || it->is_number_float())
+        {
+            return it->dump();
+        }
+
+        return std::nullopt;
+    }
+
+    std::optional<std::string> getOptionalStringParam(const json &params, std::string_view key)
+    {
+        const auto it = params.find(std::string(key));
+        if (it == params.end() || it->is_null())
+        {
+            return std::nullopt;
+        }
+        return getRequiredStringParam(params, key);
+    }
+
+    void appendCommandToken(std::string &command, const std::string &value)
+    {
+        command.push_back(' ');
+        command.append(value);
+    }
+
+    json buildBridgeDescribePayload()
+    {
+        json payload;
+        payload["protocol"] = "native-tcp-bridge";
+        payload["request_shapes"] = json::array({
+            {
+                {"name", "structured"},
+                {"fields", json::array({"operation", "params"})},
+            },
+            {
+                {"name", "legacy"},
+                {"fields", json::array({"command", "args"})},
+            },
+        });
+        payload["operations"] = json::array({
+            "bridge.describe",
+            "bridge.ping",
+            "target.pid.get",
+            "target.pid.set",
+            "target.pid.current",
+            "target.attach.package",
+            "memory.info.full",
+            "module.resolve",
+            "scan.start",
+            "scan.refine",
+            "scan.status",
+            "scan.clear",
+            "scan.page",
+            "viewer.open",
+            "viewer.move",
+            "viewer.offset",
+            "viewer.set_format",
+            "viewer.snapshot",
+            "pointer.status",
+            "pointer.scan",
+            "pointer.merge",
+            "pointer.export",
+            "breakpoint.info",
+            "breakpoint.set",
+            "breakpoint.clear",
+            "breakpoint.record.remove",
+            "breakpoint.record.update",
+            "signature.scan_address",
+            "signature.scan_file",
+            "signature.scan_pattern",
+            "signature.filter",
+            "lock.set",
+            "lock.unset",
+            "lock.status",
+            "lock.clear",
+            "memory.read_block",
+            "memory.read_value",
+            "memory.write_block",
+        });
+        return payload;
+    }
+
+    json tryDispatchStructuredOperation(const std::shared_ptr<ClientSession> &session, std::string_view operation, const json &params)
+    {
+        auto requireString = [&](std::string_view key, std::string_view desc) -> std::variant<std::string, json>
+        {
+            const auto value = getRequiredStringParam(params, key);
+            if (!value.has_value() || value->empty())
+            {
+                return makeProtocolError(std::format("operation={} 缺少参数 {}", operation, desc), operation);
+            }
+            return *value;
+        };
+
+        auto optionalString = [&](std::string_view key) -> std::string
+        {
+            const auto value = getOptionalStringParam(params, key);
+            return value.has_value() ? *value : "";
+        };
+
+        if (operation == "bridge.describe")
+        {
+            return json{
+                {"ok", true},
+                {"operation", std::string(operation)},
+                {"message", "bridge.describe"},
+                {"data", buildBridgeDescribePayload()},
+            };
+        }
+
+        std::string textCommand;
+
+        if (operation == "bridge.ping")
+        {
+            textCommand = "ping";
+        }
+        else if (operation == "target.pid.get")
+        {
+            const auto package = requireString("package_name", "package_name");
+            if (std::holds_alternative<json>(package))
+            {
+                return std::get<json>(package);
+            }
+            textCommand = "pid.get";
+            appendCommandToken(textCommand, std::get<std::string>(package));
+        }
+        else if (operation == "target.pid.set")
+        {
+            const auto pid = requireString("pid", "pid");
+            if (std::holds_alternative<json>(pid))
+            {
+                return std::get<json>(pid);
+            }
+            textCommand = "pid.set";
+            appendCommandToken(textCommand, std::get<std::string>(pid));
+        }
+        else if (operation == "target.pid.current")
+        {
+            textCommand = "pid.current";
+        }
+        else if (operation == "target.attach.package")
+        {
+            const auto package = requireString("package_name", "package_name");
+            if (std::holds_alternative<json>(package))
+            {
+                return std::get<json>(package);
+            }
+            textCommand = "pid.attach";
+            appendCommandToken(textCommand, std::get<std::string>(package));
+        }
+        else if (operation == "memory.info.full")
+        {
+            textCommand = "memory.info.full";
+        }
+        else if (operation == "module.resolve")
+        {
+            const auto moduleName = requireString("module_name", "module_name");
+            const auto segmentIndex = requireString("segment_index", "segment_index");
+            const auto which = requireString("which", "which");
+            if (std::holds_alternative<json>(moduleName))
+                return std::get<json>(moduleName);
+            if (std::holds_alternative<json>(segmentIndex))
+                return std::get<json>(segmentIndex);
+            if (std::holds_alternative<json>(which))
+                return std::get<json>(which);
+            textCommand = "module.addr";
+            appendCommandToken(textCommand, std::get<std::string>(moduleName));
+            appendCommandToken(textCommand, std::get<std::string>(segmentIndex));
+            appendCommandToken(textCommand, std::get<std::string>(which));
+        }
+        else if (operation == "scan.start" || operation == "scan.refine")
+        {
+            const auto type = requireString("value_type", "value_type");
+            const auto mode = requireString("mode", "mode");
+            if (std::holds_alternative<json>(type))
+                return std::get<json>(type);
+            if (std::holds_alternative<json>(mode))
+                return std::get<json>(mode);
+
+            const std::string typeValue = std::get<std::string>(type);
+            const std::string modeValue = std::get<std::string>(mode);
+            textCommand = (operation == "scan.start") ? "scan.first" : "scan.next";
+            appendCommandToken(textCommand, typeValue);
+            appendCommandToken(textCommand, modeValue);
+
+            const std::string value = optionalString("value");
+            if (modeValue != "unknown")
+            {
+                if (value.empty())
+                {
+                    return makeProtocolError(std::format("operation={} 在 mode={} 时必须提供 value", operation, modeValue), operation);
+                }
+                appendCommandToken(textCommand, value);
+            }
+
+            const std::string rangeMax = optionalString("range_max");
+            if (!rangeMax.empty())
+            {
+                if (modeValue == "unknown")
+                {
+                    appendCommandToken(textCommand, "0");
+                }
+                appendCommandToken(textCommand, rangeMax);
+            }
+        }
+        else if (operation == "scan.status")
+        {
+            textCommand = "scan.status";
+        }
+        else if (operation == "scan.clear")
+        {
+            textCommand = "scan.clear";
+        }
+        else if (operation == "scan.page")
+        {
+            const auto start = requireString("start", "start");
+            const auto count = requireString("count", "count");
+            const auto type = requireString("value_type", "value_type");
+            if (std::holds_alternative<json>(start))
+                return std::get<json>(start);
+            if (std::holds_alternative<json>(count))
+                return std::get<json>(count);
+            if (std::holds_alternative<json>(type))
+                return std::get<json>(type);
+            textCommand = "scan.page";
+            appendCommandToken(textCommand, std::get<std::string>(start));
+            appendCommandToken(textCommand, std::get<std::string>(count));
+            appendCommandToken(textCommand, std::get<std::string>(type));
+        }
+        else if (operation == "viewer.open")
+        {
+            const auto address = requireString("address", "address");
+            if (std::holds_alternative<json>(address))
+                return std::get<json>(address);
+            textCommand = "viewer.open";
+            appendCommandToken(textCommand, std::get<std::string>(address));
+            const std::string viewFormat = optionalString("view_format");
+            if (!viewFormat.empty())
+            {
+                appendCommandToken(textCommand, viewFormat);
+            }
+        }
+        else if (operation == "viewer.move")
+        {
+            const auto lines = requireString("lines", "lines");
+            if (std::holds_alternative<json>(lines))
+                return std::get<json>(lines);
+            textCommand = "viewer.move";
+            appendCommandToken(textCommand, std::get<std::string>(lines));
+            const std::string step = optionalString("step");
+            if (!step.empty())
+            {
+                appendCommandToken(textCommand, step);
+            }
+        }
+        else if (operation == "viewer.offset")
+        {
+            const auto offset = requireString("offset", "offset");
+            if (std::holds_alternative<json>(offset))
+                return std::get<json>(offset);
+            textCommand = "viewer.offset";
+            appendCommandToken(textCommand, std::get<std::string>(offset));
+        }
+        else if (operation == "viewer.set_format")
+        {
+            const auto viewFormat = requireString("view_format", "view_format");
+            if (std::holds_alternative<json>(viewFormat))
+                return std::get<json>(viewFormat);
+            textCommand = "viewer.format";
+            appendCommandToken(textCommand, std::get<std::string>(viewFormat));
+        }
+        else if (operation == "viewer.snapshot")
+        {
+            textCommand = "viewer.get";
+        }
+        else if (operation == "pointer.status")
+        {
+            textCommand = "pointer.status";
+        }
+        else if (operation == "pointer.scan")
+        {
+            const std::string mode = optionalString("mode").empty() ? "module" : optionalString("mode");
+            const auto target = requireString("target", "target");
+            const auto depth = requireString("depth", "depth");
+            const auto maxOffset = requireString("max_offset", "max_offset");
+            if (std::holds_alternative<json>(target))
+                return std::get<json>(target);
+            if (std::holds_alternative<json>(depth))
+                return std::get<json>(depth);
+            if (std::holds_alternative<json>(maxOffset))
+                return std::get<json>(maxOffset);
+
+            if (mode == "manual")
+            {
+                const auto manualBase = requireString("manual_base", "manual_base");
+                const auto manualMaxOffset = requireString("manual_max_offset", "manual_max_offset");
+                if (std::holds_alternative<json>(manualBase))
+                    return std::get<json>(manualBase);
+                if (std::holds_alternative<json>(manualMaxOffset))
+                    return std::get<json>(manualMaxOffset);
+                textCommand = "pointer.scan.manual";
+                appendCommandToken(textCommand, std::get<std::string>(target));
+                appendCommandToken(textCommand, std::get<std::string>(depth));
+                appendCommandToken(textCommand, std::get<std::string>(maxOffset));
+                appendCommandToken(textCommand, std::get<std::string>(manualBase));
+                appendCommandToken(textCommand, std::get<std::string>(manualMaxOffset));
+            }
+            else if (mode == "array")
+            {
+                const auto arrayBase = requireString("array_base", "array_base");
+                const auto arrayCount = requireString("array_count", "array_count");
+                if (std::holds_alternative<json>(arrayBase))
+                    return std::get<json>(arrayBase);
+                if (std::holds_alternative<json>(arrayCount))
+                    return std::get<json>(arrayCount);
+                textCommand = "pointer.scan.array";
+                appendCommandToken(textCommand, std::get<std::string>(target));
+                appendCommandToken(textCommand, std::get<std::string>(depth));
+                appendCommandToken(textCommand, std::get<std::string>(maxOffset));
+                appendCommandToken(textCommand, std::get<std::string>(arrayBase));
+                appendCommandToken(textCommand, std::get<std::string>(arrayCount));
+            }
+            else
+            {
+                textCommand = "pointer.scan";
+                appendCommandToken(textCommand, std::get<std::string>(target));
+                appendCommandToken(textCommand, std::get<std::string>(depth));
+                appendCommandToken(textCommand, std::get<std::string>(maxOffset));
+            }
+
+            const std::string moduleFilter = optionalString("module_filter");
+            if (!moduleFilter.empty())
+            {
+                appendCommandToken(textCommand, moduleFilter);
+            }
+        }
+        else if (operation == "pointer.merge")
+        {
+            textCommand = "pointer.merge";
+        }
+        else if (operation == "pointer.export")
+        {
+            textCommand = "pointer.export";
+        }
+        else if (operation == "breakpoint.info")
+        {
+            textCommand = "hwbp.info";
+        }
+        else if (operation == "breakpoint.set")
+        {
+            const auto address = requireString("address", "address");
+            const auto bpType = requireString("bp_type", "bp_type");
+            const auto bpScope = requireString("bp_scope", "bp_scope");
+            const auto length = requireString("length", "length");
+            if (std::holds_alternative<json>(address))
+                return std::get<json>(address);
+            if (std::holds_alternative<json>(bpType))
+                return std::get<json>(bpType);
+            if (std::holds_alternative<json>(bpScope))
+                return std::get<json>(bpScope);
+            if (std::holds_alternative<json>(length))
+                return std::get<json>(length);
+            textCommand = "hwbp.set";
+            appendCommandToken(textCommand, std::get<std::string>(address));
+            appendCommandToken(textCommand, std::get<std::string>(bpType));
+            appendCommandToken(textCommand, std::get<std::string>(bpScope));
+            appendCommandToken(textCommand, std::get<std::string>(length));
+        }
+        else if (operation == "breakpoint.clear")
+        {
+            textCommand = "hwbp.remove";
+        }
+        else if (operation == "breakpoint.record.remove")
+        {
+            const auto index = requireString("index", "index");
+            if (std::holds_alternative<json>(index))
+                return std::get<json>(index);
+            textCommand = "hwbp.record.remove";
+            appendCommandToken(textCommand, std::get<std::string>(index));
+        }
+        else if (operation == "breakpoint.record.update")
+        {
+            const auto index = requireString("index", "index");
+            const auto field = requireString("field", "field");
+            const auto value = requireString("value", "value");
+            if (std::holds_alternative<json>(index))
+                return std::get<json>(index);
+            if (std::holds_alternative<json>(field))
+                return std::get<json>(field);
+            if (std::holds_alternative<json>(value))
+                return std::get<json>(value);
+            textCommand = "hwbp.record.set";
+            appendCommandToken(textCommand, std::get<std::string>(index));
+            appendCommandToken(textCommand, std::get<std::string>(field));
+            appendCommandToken(textCommand, std::get<std::string>(value));
+        }
+        else if (operation == "signature.scan_address")
+        {
+            const auto address = requireString("address", "address");
+            const auto range = requireString("range", "range");
+            if (std::holds_alternative<json>(address))
+                return std::get<json>(address);
+            if (std::holds_alternative<json>(range))
+                return std::get<json>(range);
+            textCommand = "sig.scan.addr";
+            appendCommandToken(textCommand, std::get<std::string>(address));
+            appendCommandToken(textCommand, std::get<std::string>(range));
+            const std::string fileName = optionalString("file_name");
+            if (!fileName.empty())
+            {
+                appendCommandToken(textCommand, fileName);
+            }
+        }
+        else if (operation == "signature.scan_file")
+        {
+            textCommand = "sig.scan.file";
+            const std::string fileName = optionalString("file_name");
+            if (!fileName.empty())
+            {
+                appendCommandToken(textCommand, fileName);
+            }
+        }
+        else if (operation == "signature.scan_pattern")
+        {
+            const auto rangeOffset = requireString("range_offset", "range_offset");
+            const auto pattern = requireString("pattern", "pattern");
+            if (std::holds_alternative<json>(rangeOffset))
+                return std::get<json>(rangeOffset);
+            if (std::holds_alternative<json>(pattern))
+                return std::get<json>(pattern);
+            textCommand = "sig.scan.pattern";
+            appendCommandToken(textCommand, std::get<std::string>(rangeOffset));
+            appendCommandToken(textCommand, std::get<std::string>(pattern));
+        }
+        else if (operation == "signature.filter")
+        {
+            const auto address = requireString("address", "address");
+            if (std::holds_alternative<json>(address))
+                return std::get<json>(address);
+            textCommand = "sig.filter";
+            appendCommandToken(textCommand, std::get<std::string>(address));
+            const std::string fileName = optionalString("file_name");
+            if (!fileName.empty())
+            {
+                appendCommandToken(textCommand, fileName);
+            }
+        }
+        else if (operation == "lock.set")
+        {
+            const auto address = requireString("address", "address");
+            const auto valueType = requireString("value_type", "value_type");
+            const auto value = requireString("value", "value");
+            if (std::holds_alternative<json>(address))
+                return std::get<json>(address);
+            if (std::holds_alternative<json>(valueType))
+                return std::get<json>(valueType);
+            if (std::holds_alternative<json>(value))
+                return std::get<json>(value);
+            textCommand = "lock.set";
+            appendCommandToken(textCommand, std::get<std::string>(address));
+            appendCommandToken(textCommand, std::get<std::string>(valueType));
+            appendCommandToken(textCommand, std::get<std::string>(value));
+        }
+        else if (operation == "lock.unset")
+        {
+            const auto address = requireString("address", "address");
+            if (std::holds_alternative<json>(address))
+                return std::get<json>(address);
+            textCommand = "lock.unset";
+            appendCommandToken(textCommand, std::get<std::string>(address));
+        }
+        else if (operation == "lock.status")
+        {
+            const auto address = requireString("address", "address");
+            if (std::holds_alternative<json>(address))
+                return std::get<json>(address);
+            textCommand = "lock.status";
+            appendCommandToken(textCommand, std::get<std::string>(address));
+        }
+        else if (operation == "lock.clear")
+        {
+            textCommand = "lock.clear";
+        }
+        else if (operation == "memory.read_block")
+        {
+            const auto address = requireString("address", "address");
+            const auto size = requireString("size", "size");
+            if (std::holds_alternative<json>(address))
+                return std::get<json>(address);
+            if (std::holds_alternative<json>(size))
+                return std::get<json>(size);
+            textCommand = "mem.read";
+            appendCommandToken(textCommand, std::get<std::string>(address));
+            appendCommandToken(textCommand, std::get<std::string>(size));
+        }
+        else if (operation == "memory.read_value")
+        {
+            const auto address = requireString("address", "address");
+            const auto valueType = requireString("value_type", "value_type");
+            if (std::holds_alternative<json>(address))
+                return std::get<json>(address);
+            if (std::holds_alternative<json>(valueType))
+                return std::get<json>(valueType);
+
+            static const std::unordered_map<std::string, std::string> valueCommandMap = {
+                {"u8", "mem.read_u8"},
+                {"u16", "mem.read_u16"},
+                {"u32", "mem.read_u32"},
+                {"u64", "mem.read_u64"},
+                {"f32", "mem.read_f32"},
+                {"f64", "mem.read_f64"},
+            };
+
+            const auto commandIt = valueCommandMap.find(std::get<std::string>(valueType));
+            if (commandIt == valueCommandMap.end())
+            {
+                return makeProtocolError("memory.read_value 的 value_type 仅支持 u8/u16/u32/u64/f32/f64", operation);
+            }
+
+            textCommand = commandIt->second;
+            appendCommandToken(textCommand, std::get<std::string>(address));
+        }
+        else if (operation == "memory.write_block")
+        {
+            const auto address = requireString("address", "address");
+            const auto dataHex = requireString("data_hex", "data_hex");
+            if (std::holds_alternative<json>(address))
+                return std::get<json>(address);
+            if (std::holds_alternative<json>(dataHex))
+                return std::get<json>(dataHex);
+            textCommand = "mem.write";
+            appendCommandToken(textCommand, std::get<std::string>(address));
+            appendCommandToken(textCommand, std::get<std::string>(dataHex));
+        }
+        else
+        {
+            return makeProtocolError(std::format("未知 operation: {}", operation), operation);
+        }
+
+        const std::string textResponse = DispatchTextCommand(session, textCommand);
+        json out = buildJsonResponseFromText(textResponse);
+        out["session_id"] = session->sessionId;
+        out["operation"] = std::string(operation);
+        const auto commandTokens = splitTokens(textCommand);
+        out["command"] = commandTokens.empty() ? "" : commandTokens[0];
+        return out;
+    }
+
     // 统一命令派发入口：网络层仅接受 JSON 请求并返回 JSON 响应。
-    std::string DispatchCommandUnified(const std::string &request)
+    std::string DispatchCommandUnified(const std::shared_ptr<ClientSession> &session, const std::string &request)
     {
         const auto parsedReq = json::parse(request, nullptr, false);
         if (parsedReq.is_discarded())
@@ -4493,9 +5122,30 @@ namespace
             return json({{"ok", false}, {"error", "请求必须是 JSON 对象"}}).dump();
         }
 
+        if (parsedReq.contains("operation"))
+        {
+            if (!parsedReq["operation"].is_string())
+            {
+                return makeProtocolError("operation 字段必须是字符串").dump();
+            }
+
+            const std::string operationName = parsedReq["operation"].get<std::string>();
+            json params = json::object();
+            if (parsedReq.contains("params"))
+            {
+                if (!parsedReq["params"].is_object())
+                {
+                    return makeProtocolError("params 字段必须是对象", operationName).dump();
+                }
+                params = parsedReq["params"];
+            }
+
+            return tryDispatchStructuredOperation(session, operationName, params).dump();
+        }
+
         if (!parsedReq.contains("command") || !parsedReq["command"].is_string())
         {
-            return json({{"ok", false}, {"error", "请求缺少 command 字段"}}).dump();
+            return makeProtocolError("请求缺少 command 或 operation 字段").dump();
         }
 
         const std::string commandName = parsedReq["command"].get<std::string>();
@@ -4529,10 +5179,79 @@ namespace
             }
         }
 
-        const std::string textResponse = DispatchTextCommand(textCommand);
+        const std::string textResponse = DispatchTextCommand(session, textCommand);
         json out = buildJsonResponseFromText(textResponse);
+        out["session_id"] = session->sessionId;
         out["command"] = commandName;
         return out.dump();
+    }
+
+    void HandleClientConnection(int clientFd, sockaddr_in clientAddr)
+    {
+        const auto session = std::make_shared<ClientSession>(gClientSessionSeed.fetch_add(1));
+
+        char clientIp[INET_ADDRSTRLEN]{};
+        if (inet_ntop(AF_INET, &clientAddr.sin_addr, clientIp, sizeof(clientIp)) == nullptr)
+        {
+            std::strncpy(clientIp, "未知地址", sizeof(clientIp) - 1);
+            clientIp[sizeof(clientIp) - 1] = '\0';
+        }
+
+        std::println("客户端已连接：{}:{} session={}", clientIp, ntohs(clientAddr.sin_port), session->sessionId);
+
+        std::string buffer;
+        buffer.reserve(4096);
+        char recvChunk[4096]{};
+
+        while (gRunning)
+        {
+            const ssize_t receivedBytes = recv(clientFd, recvChunk, sizeof(recvChunk), 0);
+            if (receivedBytes == 0)
+            {
+                std::println("客户端已断开连接：session={}", session->sessionId);
+                break;
+            }
+
+            if (receivedBytes < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                printErrno("接收数据失败");
+                break;
+            }
+
+            buffer.append(recvChunk, recvChunk + receivedBytes);
+
+            for (;;)
+            {
+                const auto newlinePos = buffer.find('\n');
+                if (newlinePos == std::string::npos)
+                {
+                    break;
+                }
+
+                std::string message = buffer.substr(0, newlinePos);
+                buffer.erase(0, newlinePos + 1);
+                trimLineEnding(message);
+                if (message.empty())
+                {
+                    continue;
+                }
+
+                std::println("收到命令：session={} {}", session->sessionId, message);
+                const std::string response = DispatchCommandUnified(session, message) + "\n";
+                if (!sendAll(clientFd, response))
+                {
+                    printErrno("发送回复失败");
+                    close(clientFd);
+                    return;
+                }
+            }
+        }
+
+        close(clientFd);
     }
 } // namespace
 
@@ -4581,8 +5300,6 @@ int main(int argc, char **)
 
     std::println("TCP 服务端已监听 0.0.0.0:{}", kServerPort);
 
-    char buffer[4096]{};
-
     while (gRunning)
     {
         sockaddr_in clientAddr{};
@@ -4598,49 +5315,11 @@ int main(int argc, char **)
             continue;
         }
 
-        char clientIp[INET_ADDRSTRLEN]{};
-        if (inet_ntop(AF_INET, &clientAddr.sin_addr, clientIp, sizeof(clientIp)) == nullptr)
+        if (!Utils::GlobalPool.post_io(HandleClientConnection, clientFd, clientAddr))
         {
-            std::strncpy(clientIp, "未知地址", sizeof(clientIp) - 1);
-            clientIp[sizeof(clientIp) - 1] = '\0';
+            printErrno("IO线程池已停止，无法派发连接");
+            close(clientFd);
         }
-
-        std::println("客户端已连接：{}:{}", clientIp, ntohs(clientAddr.sin_port));
-
-        while (gRunning)
-        {
-            const ssize_t receivedBytes = recv(clientFd, buffer, sizeof(buffer) - 1, 0);
-            if (receivedBytes == 0)
-            {
-                std::println("客户端已断开连接。");
-                break;
-            }
-
-            if (receivedBytes < 0)
-            {
-                if (errno == EINTR)
-                {
-                    continue;
-                }
-                printErrno("接收数据失败");
-                break;
-            }
-
-            buffer[receivedBytes] = '\0';
-            std::string message(buffer, static_cast<std::size_t>(receivedBytes));
-            trimLineEnding(message);
-
-            std::println("收到命令：{}", message);
-            const std::string response = DispatchCommandUnified(message) + "\n";
-
-            if (!sendAll(clientFd, response))
-            {
-                printErrno("发送回复失败");
-                break;
-            }
-        }
-
-        close(clientFd);
     }
 
     if (gServerFd >= 0)
@@ -4648,6 +5327,8 @@ int main(int argc, char **)
         close(gServerFd);
         gServerFd = -1;
     }
+
+    Utils::GlobalPool.force_stop();
 
     std::println("服务端已退出。");
     return 0;

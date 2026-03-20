@@ -88,6 +88,8 @@ namespace Config
     struct Constants
     {
         static constexpr size_t MEM_VIEW_RANGE = 50;
+        // 内存浏览缓存默认保留当前地址上下各 4096 字节。
+        static constexpr size_t MEM_VIEW_DEFAULT_BYTES = 8192;
         static constexpr size_t SCAN_BUFFER = 4096;
         static constexpr size_t BATCH_SIZE = 16384;
         static constexpr size_t MAX_READ_GAP = 64;
@@ -131,6 +133,7 @@ namespace Types
     enum class ViewFormat : uint8_t
     {
         Hex,
+        Hex16,
         Hex64,
         I8,
         I16,
@@ -149,25 +152,58 @@ namespace Types
         auto operator<=>(const MemNode &) const = default;
     };
 
+    // 编译期大小查表
     namespace Labels
     {
-        constexpr std::array TYPE = {"Int8", "Int16", "Int32", "Int64", "Float", "Double"};
-        constexpr std::array FUZZY = {"未知", "等于", "大于", "小于", "增加", "减少", "改变", "不变", "范围", "指针"};
-        constexpr std::array FORMAT = {"HexDump", "Hex64", "I8", "I16", "I32", "I64", "Float", "Double", "Disasm"};
-    }
+        inline constexpr std::array<const char *, static_cast<size_t>(DataType::Count)> TYPE = {
+            "Int8",
+            "Int16",
+            "Int32",
+            "Int64",
+            "Float",
+            "Double",
+        };
 
-    // 编译期大小查表
+        inline constexpr std::array<const char *, static_cast<size_t>(FuzzyMode::Count)> FUZZY = {
+            "未知",
+            "等于",
+            "大于",
+            "小于",
+            "增加",
+            "减少",
+            "已变化",
+            "未变化",
+            "范围",
+            "指针",
+        };
+
+        inline constexpr std::array<const char *, static_cast<size_t>(ViewFormat::Count)> FORMAT = {
+            "Hex",
+            "Hex16",
+            "Hex64",
+            "Int8",
+            "Int16",
+            "Int32",
+            "Int64",
+            "Float",
+            "Double",
+            "Disasm",
+        };
+    } // namespace Labels
+
     namespace detail
     {
         constexpr std::array<size_t, 6> kDataSizes = {1, 2, 4, 8, 4, 8};
-        constexpr std::array<size_t, 9> kViewSizes = {1, 8, 1, 2, 4, 8, 4, 8, 4};
+        constexpr std::array<size_t, 10> kViewSizes = {1, 2, 8, 1, 2, 4, 8, 4, 8, 4};
     }
 
+    // 根据数据类型返回对应字节数。
     constexpr size_t GetDataSize(DataType t) noexcept
     {
         auto i = std::to_underlying(t);
         return i < detail::kDataSizes.size() ? detail::kDataSizes[i] : 1;
     }
+    // 根据浏览格式返回移动步长。
     constexpr size_t GetViewSize(ViewFormat f) noexcept
     {
         auto i = std::to_underlying(f);
@@ -232,6 +268,7 @@ namespace MemUtils
     // 值的字符串转换
     namespace detail
     {
+        // 把数值按类型格式化为字符串。
         template <typename T>
         std::string ValueToString(T val)
         {
@@ -242,7 +279,7 @@ namespace MemUtils
             else
                 return std::to_string(static_cast<long long>(val));
         }
-
+        // 把字符串解析为目标类型数值。
         template <typename T>
         T StringToValue(const std::string &s)
         {
@@ -256,6 +293,7 @@ namespace MemUtils
         }
     }
 
+    // 按指定类型读取内存并转为字符串。
     inline std::string ReadAsString(uintptr_t addr, DataType type)
     {
         addr = Normalize(addr);
@@ -265,6 +303,7 @@ namespace MemUtils
                             { return detail::ValueToString(dr.Read<T>(addr)); });
     }
 
+    // 把字符串按指定类型写入目标地址。
     inline bool WriteFromString(uintptr_t addr, DataType type, std::string_view str)
     {
         addr = Normalize(addr);
@@ -282,6 +321,7 @@ namespace MemUtils
         }
     }
 
+    // 读取指针值并格式化为十六进制文本。
     inline std::string ReadAsPointerString(uintptr_t addr)
     {
         addr = Normalize(addr);
@@ -290,6 +330,7 @@ namespace MemUtils
         return std::format("{:X}", Normalize(static_cast<uintptr_t>(dr.Read<int64_t>(addr))));
     }
 
+    // 把十六进制文本解析后写入指针值。
     inline bool WritePointerFromString(uintptr_t addr, std::string_view str)
     {
         addr = Normalize(addr);
@@ -306,7 +347,7 @@ namespace MemUtils
         }
     }
 
-    // 统一比较
+    //  按扫描模式比较当前值与目标值。
     template <typename T>
     bool Compare(T value, T target, FuzzyMode mode, double lastValue, double rangeMax = 0.0)
     {
@@ -392,6 +433,7 @@ namespace MemUtils
         bool negative;
     };
 
+    // 解析形如 ±0xNN 的偏移文本。
     inline std::optional<OffsetParseResult> ParseHexOffset(std::string_view str)
     {
         if (str.empty())
@@ -466,6 +508,7 @@ public:
         return *this;
     }
 
+    // 申请并初始化底层内存映射。
     bool allocate(size_t sz)
     {
         release();
@@ -492,6 +535,7 @@ public:
         return true;
     }
 
+    // 释放当前对象持有的底层资源。
     void release()
     {
         if (ptr_)
@@ -513,9 +557,12 @@ public:
     template <typename T = void>
     const T *as() const noexcept { return static_cast<const T *>(ptr_); }
 
+    // 返回当前映射区域的字节大小。
     size_t size() const noexcept { return size_; }
+    // 判断当前映射指针是否有效。
     bool valid() const noexcept { return ptr_ != nullptr; }
 
+    // 向内核提示映射区域的访问模式。
     void advise(int advice)
     {
         if (ptr_)
@@ -532,6 +579,7 @@ class Bitmap
     size_t totalBits_ = 0;
 
 public:
+    // 按位数初始化位图存储。
     bool init(size_t bits, bool allSet)
     {
         totalBits_ = bits;
@@ -556,29 +604,36 @@ public:
         return true;
     }
 
+    // 释放当前对象持有的底层资源。
     void release()
     {
         storage_.release();
         totalBits_ = 0;
     }
 
+    // 返回位图可表示的总位数。
     size_t totalBits() const noexcept { return totalBits_; }
+    // 返回位图底层字节数组大小。
     size_t byteCount() const noexcept { return storage_.size(); }
+    // 判断位图底层存储是否可用。
     bool valid() const noexcept { return storage_.valid(); }
     uint8_t *data() noexcept { return storage_.as<uint8_t>(); }
     const uint8_t *data() const noexcept { return storage_.as<const uint8_t>(); }
 
+    // 读取指定位当前是否为 1。
     bool get(size_t i) const noexcept
     {
         return (data()[i / 8] >> (i % 8)) & 1;
     }
 
+    // 把指定位设置为 1。
     void setOn(size_t i) noexcept
     {
         __atomic_fetch_or(&data()[i / 8],
                           static_cast<uint8_t>(1u << (i % 8)), __ATOMIC_RELAXED);
     }
 
+    // 把指定位清零为 0。
     void setOff(size_t i) noexcept
     {
         __atomic_fetch_and(&data()[i / 8],
@@ -658,6 +713,7 @@ private:
         return it->bitOffset + index;
     }
 
+    // 把位图索引换算为实际内存地址。
     uintptr_t bitToAddr(size_t gb) const noexcept
     {
         auto it = std::upper_bound(regions_.begin(), regions_.end(), gb,
@@ -707,7 +763,7 @@ private:
     double *valuesMap() noexcept { return values_.as<double>(); }
     const double *valuesMap() const noexcept { return values_.as<const double>(); }
 
-    // 值转 double
+    // 将模板数值统一转换为 double。
     template <typename T>
     static double toDouble(T value, Types::FuzzyMode mode) noexcept
     {
@@ -735,6 +791,7 @@ private:
 
     //  统一的区域遍历核心
     template <typename ProcessFn>
+    // 并发遍历内存区域执行扫描逻辑。
     void parallelRegionScan(ProcessFn &&process)
     {
         unsigned tc = threadCount();
@@ -770,8 +827,9 @@ private:
             f.get();
     }
 
-    // 清除不可读区域的位
+    // 清除不可读范围对应的位标记。
     template <typename T>
+
     void clearUnreadableBits(const Region &reg, uintptr_t addr, size_t from, size_t to)
     {
         for (size_t off = from; off + sizeof(T) <= to; off += sizeof(T))
@@ -786,7 +844,7 @@ private:
     //  首扫 Unknown — bitmap 全 1 + 记录旧值
     // ================================================================
     template <typename T>
-    void scanFirstUnknown(pid_t pid)
+    void scanFirstUnknown(pid_t /*pid*/)
     {
         auto scanRegs = dr.GetScanRegions();
         if (scanRegs.empty())
@@ -834,7 +892,7 @@ private:
     //  首扫有目标值
     // ================================================================
     template <typename T>
-    void scanFirst(pid_t pid, T target, Types::FuzzyMode mode)
+    void scanFirst(pid_t /*pid*/, T target, Types::FuzzyMode mode)
     {
         auto scanRegs = dr.GetScanRegions();
         if (scanRegs.empty())
@@ -983,9 +1041,12 @@ public:
     MemScanner(const MemScanner &) = delete;
     MemScanner &operator=(const MemScanner &) = delete;
 
+    // 返回扫描线程当前是否在运行。
     bool isScanning() const noexcept { return scanning_; }
+    // 返回当前扫描进度百分比(0~1)。
     float progress() const noexcept { return progress_; }
 
+    // 返回当前结果数量。
     size_t count() const
     {
         std::shared_lock lock(mutex_);
@@ -1074,6 +1135,7 @@ public:
         }
     }
 
+    // 向结果集合追加单个地址。
     void add(uintptr_t addr)
     {
         std::unique_lock lock(mutex_);
@@ -1154,8 +1216,9 @@ public:
         setBits_ = actualSet;
     }
 
-    // 扫描入口
+    // 执行指针链扫描主流程。
     template <typename T>
+
     void scan(pid_t pid, T target, Types::FuzzyMode mode, bool isFirst, double rangeMax = 0.0)
     {
         if (scanning_.exchange(true))
@@ -1204,17 +1267,20 @@ private:
     };
     std::list<LockItem> locks_;
     mutable std::mutex mutex_;
-    std::jthread writeThread_;
+    std::future<void> writeTask_;
+    std::atomic<bool> writeStop_{false};
 
+    // 按地址查找锁定项。
     auto find(uintptr_t addr)
     {
         return std::ranges::find_if(locks_, [addr](auto &i)
                                     { return i.addr == addr; });
     }
 
-    void writeLoop(std::stop_token stoken)
+    // 后台循环写入被锁定的内存项。
+    void writeLoop()
     {
-        while (!stoken.stop_requested() && Config::g_Running)
+        while (!writeStop_.load(std::memory_order_acquire) && Config::g_Running)
         {
             {
                 std::lock_guard lock(mutex_);
@@ -1227,11 +1293,19 @@ private:
 
 public:
     LockManager()
-        : writeThread_([this](std::stop_token st)
-                       { writeLoop(st); }) {}
+    {
+        writeTask_ = Utils::GlobalPool.push_io([this]
+                                               { writeLoop(); });
+    }
 
-    ~LockManager() { writeThread_.request_stop(); }
+    ~LockManager()
+    {
+        writeStop_.store(true, std::memory_order_release);
+        if (writeTask_.valid())
+            writeTask_.wait();
+    }
 
+    // 判断目标地址是否处于锁定状态。
     bool isLocked(uintptr_t addr) const
     {
         std::lock_guard lock(mutex_);
@@ -1239,6 +1313,7 @@ public:
                                    { return i.addr == addr; });
     }
 
+    // 切换目标地址的锁定状态。
     void toggle(uintptr_t addr, Types::DataType type)
     {
         std::lock_guard lock(mutex_);
@@ -1248,6 +1323,7 @@ public:
             locks_.push_back({addr, type, MemUtils::ReadAsString(addr, type)});
     }
 
+    // 锁定指定地址并记录目标值。
     void lock(uintptr_t addr, Types::DataType type, const std::string &value)
     {
         std::lock_guard lk(mutex_);
@@ -1255,6 +1331,7 @@ public:
             locks_.push_back({addr, type, value});
     }
 
+    // 取消指定地址的锁定。
     void unlock(uintptr_t addr)
     {
         std::lock_guard lk(mutex_);
@@ -1262,6 +1339,7 @@ public:
                       { return item.addr == addr; });
     }
 
+    // 批量锁定一组地址。
     void lockBatch(std::span<const uintptr_t> addrs, Types::DataType type)
     {
         std::lock_guard lk(mutex_);
@@ -1273,6 +1351,7 @@ public:
         }
     }
 
+    // 批量取消锁定一组地址。
     void unlockBatch(std::span<const uintptr_t> addrs)
     {
         std::lock_guard lk(mutex_);
@@ -1281,6 +1360,7 @@ public:
                           { return item.addr == addr; });
     }
 
+    // 清空当前模块维护的全部数据。
     void clear()
     {
         std::lock_guard lk(mutex_);
@@ -1304,17 +1384,24 @@ private:
     int disasmScrollIdx_ = 0;
 
 public:
-    MemViewer() : buffer_(Config::Constants::MEM_VIEW_RANGE * 2) {}
+    MemViewer() : buffer_(Config::Constants::MEM_VIEW_DEFAULT_BYTES) {}
 
+    // 返回当前视图可见状态。
     bool isVisible() const noexcept { return visible_; }
+    // 设置当前视图可见状态。
     void setVisible(bool v) noexcept { visible_ = v; }
+    // 返回当前内存浏览格式。
     Types::ViewFormat format() const noexcept { return format_; }
+    // 返回最近一次读取是否成功。
     bool readSuccess() const noexcept { return readSuccess_; }
+    // 返回当前浏览基址。
     uintptr_t base() const noexcept { return base_; }
     const std::vector<uint8_t> &buffer() const noexcept { return buffer_; }
     const std::vector<Disasm::DisasmLine> &getDisasm() const noexcept { return disasmCache_; }
+    // 返回当前反汇编滚动索引。
     int disasmScrollIdx() const noexcept { return disasmScrollIdx_; }
 
+    // 切换浏览格式并触发刷新。
     void setFormat(Types::ViewFormat fmt)
     {
         format_ = fmt;
@@ -1322,6 +1409,7 @@ public:
         refresh();
     }
 
+    // 打开指定地址并初始化浏览状态。
     void open(uintptr_t addr)
     {
         if (format_ == Types::ViewFormat::Disasm)
@@ -1332,6 +1420,7 @@ public:
         visible_ = true;
     }
 
+    // 按指定行数移动当前浏览窗口。
     void move(int lines, size_t step)
     {
         if (format_ == Types::ViewFormat::Disasm)
@@ -1349,6 +1438,7 @@ public:
         }
     }
 
+    // 重新读取并刷新当前浏览缓存。
     void refresh()
     {
         if (base_ > Config::Constants::ADDR_MAX)
@@ -1376,6 +1466,7 @@ public:
         }
     }
 
+    // 按偏移字符串调整当前浏览基址。
     bool applyOffset(std::string_view offsetStr)
     {
         auto result = MemUtils::ParseHexOffset(offsetStr);
@@ -1386,6 +1477,7 @@ public:
     }
 
 private:
+    // 在反汇编模式下移动显示窗口。
     void moveDisasm(int lines)
     {
         if (lines == 0)
@@ -1511,6 +1603,7 @@ private:
     std::atomic<float> scanProgress_{0.0f};
     size_t chainCount_ = 0;
 
+    // 生成可用的指针结果文件名。
     static std::string NextBinName()
     {
         char path[256];
@@ -1527,6 +1620,7 @@ private:
     }
 
     template <typename F>
+    // 借用缓冲块执行任务并自动归还。
     void with_buffer_block(char **bufs, int &idx, uintptr_t start, size_t len, F &&call)
     {
         char *buf;
@@ -1554,6 +1648,7 @@ private:
         call(buf, start, len);
     }
 
+    // 扫描缓冲块并提取候选指针。
     void collect_pointers_block(char *buf, uintptr_t start, size_t len, FILE *&out)
     {
         out = tmpfile();
@@ -1603,6 +1698,7 @@ private:
     }
 
     template <typename C, typename F, typename V>
+    // 执行有序数据的二分查找定位。
     static void bin_search(C &c, F &&cmp, V target, size_t sz, int &lo, int &hi)
     {
         lo = 0;
@@ -1617,6 +1713,7 @@ private:
         }
     }
 
+    // 在候选指针中筛选可匹配项。
     void search_in_pointers(std::vector<PtrDir> &input, std::vector<PtrData *> &out, size_t offset, bool use_limit, size_t limit)
     {
         if (input.empty() || pointers_.empty())
@@ -1653,6 +1750,7 @@ private:
             out.push_back(result[i]);
     }
 
+    // 按模块范围过滤并归档指针。
     void filter_to_ranges_module(std::vector<std::vector<PtrDir>> &dirs, std::vector<PtrRange> &ranges, std::vector<PtrData *> &curr, int level, const std::string &filterModule)
     {
         std::unordered_set<PtrData *> matched;
@@ -1697,6 +1795,7 @@ private:
         push_unmatched(dirs, matched, curr, level);
     }
 
+    // 按组合基址策略过滤并归档指针。
     void filter_to_ranges_combined(std::vector<std::vector<PtrDir>> &dirs, std::vector<PtrRange> &ranges, std::vector<PtrData *> &curr, int level, BaseMode scanMode, const std::string &filterModule, uintptr_t manualBase, size_t manualMaxOffset, uintptr_t arrayBase, const std::vector<std::pair<size_t, uintptr_t>> &arrayEntries, size_t maxOffset)
     {
         std::unordered_set<PtrData *> matched;
@@ -1814,6 +1913,7 @@ private:
         push_unmatched(dirs, matched, curr, level);
     }
 
+    // 把未匹配项追加到下一层处理集合。
     void push_unmatched(std::vector<std::vector<PtrDir>> &dirs, std::unordered_set<PtrData *> &matched, std::vector<PtrData *> &curr, int level)
     {
         for (auto *p : curr)
@@ -1823,6 +1923,7 @@ private:
         }
     }
 
+    // 回填父子区间索引关系。
     void assoc_index(std::vector<PtrDir> &prev, PtrDir *start, size_t count, size_t offset)
     {
         size_t sz = prev.size();
@@ -1839,6 +1940,7 @@ private:
         }
     }
 
+    // 并发建立各层索引关联。
     std::vector<std::future<void>> create_assoc_index(std::vector<PtrDir> &prev, std::vector<PtrDir> &curr, size_t offset)
     {
         std::vector<std::future<void>> futures;
@@ -1863,6 +1965,7 @@ private:
         bool valid = false;
     };
 
+    // 合并相邻且可并入的区间节点。
     void merge_dirs(const std::vector<PtrDir *> &sorted_ptrs, PtrDir *base_dir, std::vector<PtrDir *> &out)
     {
         size_t dist = 0;
@@ -1889,6 +1992,7 @@ private:
         }
     }
 
+    // 构建层级化指针目录树结构。
     DirTree build_dir_tree(std::vector<std::vector<PtrDir>> &dirs, std::vector<PtrRange> &ranges)
     {
         DirTree tree;
@@ -1945,6 +2049,7 @@ private:
         return tree;
     }
 
+    // 将指针树结果序列化写入文件。
     void write_bin_file(std::vector<std::vector<PtrDir *>> &contents, std::vector<PtrRange> &ranges, FILE *f, BaseMode scanMode, uintptr_t target, uintptr_t manualBase, uintptr_t arrayBase, size_t arrayCount)
     {
         const auto &memInfo = dr.GetMemoryInfoRef();
@@ -2025,10 +2130,14 @@ public:
     PointerManager() = default;
     ~PointerManager() = default;
 
+    // 返回指针扫描任务是否仍在运行。
     bool isScanning() const noexcept { return scanning_; }
+    // 执行扫描逻辑并更新结果。
     float scanProgress() const noexcept { return scanProgress_; }
+    // 返回当前结果数量。
     size_t count() const noexcept { return chainCount_; }
 
+    // 采集进程可用指针并建立初始集合。
     size_t CollectPointers(int buf_count = 10, int buf_size = 1 << 20)
     {
         pointers_.clear();
@@ -2093,7 +2202,8 @@ public:
         return pointers_.size();
     }
 
-    void scan(pid_t pid, uintptr_t target, int depth, int maxOffset, bool useManual, uintptr_t manualBase, int manualMaxOffset, bool useArray, uintptr_t arrayBase, size_t arrayCount, const std::string &filterModule)
+    // 执行指针链扫描主流程。
+    void scan(pid_t /*pid*/, uintptr_t target, int depth, int maxOffset, bool useManual, uintptr_t manualBase, int manualMaxOffset, bool useArray, uintptr_t arrayBase, size_t arrayCount, const std::string &filterModule)
     {
         if (scanning_.exchange(true))
             return;
@@ -2270,6 +2380,7 @@ public:
         std::vector<Block> blocks;
         std::vector<std::vector<PtrDir>> levels;
 
+        // 从二进制文件加载指针图数据。
         bool load(const std::string &path)
         {
             int fd = open(path.c_str(), O_RDONLY);
@@ -2339,6 +2450,7 @@ public:
             return true;
         }
 
+        // 将当前指针图保存到文件。
         bool save(const std::string &path)
         {
             FILE *f = fopen(path.c_str(), "wb");
@@ -2365,7 +2477,8 @@ public:
         }
     };
 
-    bool prune_dfs(const PtrDir &nodeA, const PtrDir &nodeB, int current_level, const MemoryGraph &GA, const MemoryGraph &GB, std::vector<std::vector<uint8_t>> &memo)
+    // 递归校验并裁剪无效指针分支。
+    static bool prune_dfs(const PtrDir &nodeA, const PtrDir &nodeB, int current_level, const MemoryGraph &GA, const MemoryGraph &GB, std::vector<std::vector<uint8_t>> &memo)
     {
         // 成功触底，返回 true
         if (current_level < 0)
@@ -2411,10 +2524,11 @@ public:
         }
         return any_valid;
     }
+    // 合并多轮扫描结果并裁剪失效链。
     void MergeBins()
     {
-        std::thread([this]()
-                    {
+        Utils::GlobalPool.post([]()
+                               {
             std::println("=== [MergeBins] 开始基于图裁剪算法的极速合并 ===");
 
             std::vector<std::string> files;
@@ -2537,10 +2651,10 @@ public:
             for (const auto& fn : files) remove(fn.c_str());
             rename("Pointer_Merged.tmp", "Pointer.bin");
 
-            std::println("图层合并结束！已成功剔除失效的指针树分支并生成 Pointer.bin"); })
-            .detach();
+            std::println("图层合并结束！已成功剔除失效的指针树分支并生成 Pointer.bin"); });
     }
 
+    // 将指针链导出为可读文本。
     void ExportToTxt()
     {
         std::println("=== 导出文本链条  ===");
@@ -2642,7 +2756,6 @@ public:
         std::println("导出完成: 成功向外输出了 {} 条链条！", chainCount);
     }
 };
-
 
 // ============================================================================
 // UI 构建器

@@ -1,11 +1,14 @@
 #pragma once
 
+#include <algorithm>
 #include <condition_variable>
 #include <functional>
 #include <future>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -27,6 +30,7 @@ namespace Utils
         std::condition_variable_any cv_;
         std::condition_variable done_cv_;
         size_t active_{0};
+        bool stopping_{false};
 
     public:
         explicit ThreadPool(size_t n = GetThreadCount())
@@ -41,14 +45,18 @@ namespace Utils
                         std::function<void()> task;
                         {
                             std::unique_lock lk(mtx_);
-                            cv_.wait(lk, st, [&]{ return !tasks_.empty(); });
-                            if (st.stop_requested()) return;
+                            cv_.wait(lk, st, [&]{ return stopping_ || !tasks_.empty(); });
+                            if ((st.stop_requested() || stopping_) && tasks_.empty()) return;
                             if (tasks_.empty()) continue;
                             task = std::move(tasks_.front());
                             tasks_.pop();
                             ++active_;
                         }
-                        task();
+                        try {
+                            task();
+                        } catch (...) {
+                            // 防止任务异常导致工作线程退出。
+                        }
                         {
                             std::lock_guard lk(mtx_);
                             --active_;
@@ -59,6 +67,14 @@ namespace Utils
             }
         }
 
+        ~ThreadPool()
+        {
+            shutdown(false);
+        }
+
+        ThreadPool(const ThreadPool &) = delete;
+        ThreadPool &operator=(const ThreadPool &) = delete;
+
         template <class F, class... Args>
         auto push(F &&f, Args &&...args) -> std::future<std::invoke_result_t<F, Args...>>
         {
@@ -68,11 +84,32 @@ namespace Utils
             auto fut = task->get_future();
             {
                 std::lock_guard lk(mtx_);
+                if (stopping_)
+                    throw std::runtime_error("ThreadPool is stopping");
                 tasks_.emplace([task]
                                { (*task)(); });
             }
             cv_.notify_one();
             return fut;
+        }
+
+        template <class F, class... Args>
+        bool post(F &&f, Args &&...args)
+        {
+            auto thunk = std::make_shared<std::tuple<std::decay_t<F>, std::decay_t<Args>...>>(
+                std::forward<F>(f), std::forward<Args>(args)...);
+            {
+                std::lock_guard lk(mtx_);
+                if (stopping_)
+                    return false;
+                tasks_.emplace([thunk]() mutable
+                               {
+                                   std::apply([](auto &fn, auto &...xs)
+                                              { std::invoke(fn, xs...); }, *thunk);
+                               });
+            }
+            cv_.notify_one();
+            return true;
         }
 
         void wait_all()
@@ -82,24 +119,83 @@ namespace Utils
                           { return tasks_.empty() && active_ == 0; });
         }
 
-        void force_stop()
+        void shutdown(bool drop_pending)
         {
             {
                 std::lock_guard lk(mtx_);
-                while (!tasks_.empty())
-                    tasks_.pop();
+                if (stopping_)
+                    return;
+                stopping_ = true;
+                if (drop_pending)
+                {
+                    while (!tasks_.empty())
+                        tasks_.pop();
+                }
             }
             for (auto &w : workers_)
                 w.request_stop();
             cv_.notify_all();
-            for (auto &w : workers_)
-            {
-                if (w.joinable())
-                    w.detach();
-            }
+            done_cv_.notify_all();
             workers_.clear();
+        }
+
+        void force_stop()
+        {
+            shutdown(true);
         }
     };
 
-    inline ThreadPool GlobalPool{GetThreadCount()};
+    class GlobalThreadPools
+    {
+    public:
+        ThreadPool &cpu()
+        {
+            static ThreadPool pool{GetThreadCount()};
+            return pool;
+        }
+
+        ThreadPool &io()
+        {
+            static ThreadPool pool{std::max<unsigned>(16, GetThreadCount() * 4)};
+            return pool;
+        }
+
+        template <class F, class... Args>
+        auto push(F &&f, Args &&...args) -> std::future<std::invoke_result_t<F, Args...>>
+        {
+            return cpu().push(std::forward<F>(f), std::forward<Args>(args)...);
+        }
+
+        template <class F, class... Args>
+        bool post(F &&f, Args &&...args)
+        {
+            return cpu().post(std::forward<F>(f), std::forward<Args>(args)...);
+        }
+
+        template <class F, class... Args>
+        auto push_io(F &&f, Args &&...args) -> std::future<std::invoke_result_t<F, Args...>>
+        {
+            return io().push(std::forward<F>(f), std::forward<Args>(args)...);
+        }
+
+        template <class F, class... Args>
+        bool post_io(F &&f, Args &&...args)
+        {
+            return io().post(std::forward<F>(f), std::forward<Args>(args)...);
+        }
+
+        void wait_all()
+        {
+            cpu().wait_all();
+            io().wait_all();
+        }
+
+        void force_stop()
+        {
+            cpu().force_stop();
+            io().force_stop();
+        }
+    };
+
+    inline GlobalThreadPools GlobalPool{};
 }

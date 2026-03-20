@@ -1217,6 +1217,24 @@ namespace SignatureScanner
 
     namespace
     {
+        std::string NormalizeSigFileName(const char *filename)
+        {
+            if (filename != nullptr && *filename != '\0')
+                return std::string(filename);
+            return std::string(SIG_DEFAULT_FILE);
+        }
+
+        bool IsAbsoluteSigPath(std::string_view path)
+        {
+            return !path.empty() && path.front() == '/';
+        }
+
+        std::string ResolveSigPath(std::string_view path)
+        {
+            if (IsAbsoluteSigPath(path))
+                return std::string(path);
+            return std::string("/data/akernel/") + std::string(path);
+        }
 
         std::string FormatSignature(const SigElement &sig)
         {
@@ -1309,7 +1327,7 @@ namespace SignatureScanner
                     size_t readSize = std::min(static_cast<size_t>(rEnd - addr), SIG_BUFFER_SIZE);
                     if (readSize < sigSize)
                         break;
-                    if (dr.Read(addr, buffer.data(), readSize) != 0)
+                    if (dr.Read(addr, buffer.data(), readSize) <= 0)
                         continue;
 
                     size_t searchEnd = readSize - sigSize;
@@ -1367,6 +1385,32 @@ namespace SignatureScanner
             return !fp.fail();
         }
 
+        bool ReadSigFileWithFallback(const char *filename, int &range, std::string &sigText)
+        {
+            const std::string rawName = NormalizeSigFileName(filename);
+            if (ReadSigFile(rawName.c_str(), range, sigText))
+                return true;
+            if (!IsAbsoluteSigPath(rawName))
+            {
+                const std::string fallback = ResolveSigPath(rawName);
+                return ReadSigFile(fallback.c_str(), range, sigText);
+            }
+            return false;
+        }
+
+        bool WriteSigFileWithFallback(const char *filename, uintptr_t addr, int range, const SigElement &sig)
+        {
+            const std::string rawName = NormalizeSigFileName(filename);
+            if (WriteSigFile(rawName.c_str(), addr, range, sig))
+                return true;
+            if (!IsAbsoluteSigPath(rawName))
+            {
+                const std::string fallback = ResolveSigPath(rawName);
+                return WriteSigFile(fallback.c_str(), addr, range, sig);
+            }
+            return false;
+        }
+
     } // anonymous namespace
 
     // 找特征
@@ -1387,7 +1431,7 @@ namespace SignatureScanner
         SigElement sig;
         sig.bytes.resize(totalSize);
 
-        if (dr.Read(addr - range, sig.bytes.data(), totalSize) != 0)
+        if (dr.Read(addr - range, sig.bytes.data(), totalSize) <= 0)
         {
             std::println(stderr, "[找特征] 读取失败: 0x{:X}", addr - range);
             return false;
@@ -1395,7 +1439,7 @@ namespace SignatureScanner
 
         sig.mask.assign(totalSize, true);
 
-        if (!WriteSigFile(filename, addr, range, sig))
+        if (!WriteSigFileWithFallback(filename, addr, range, sig))
         {
             std::println(stderr, "[找特征] 写文件失败: {}", filename);
             return false;
@@ -1412,7 +1456,7 @@ namespace SignatureScanner
 
         int range = 0;
         std::string oldSigText;
-        if (!ReadSigFile(filename, range, oldSigText))
+        if (!ReadSigFileWithFallback(filename, range, oldSigText))
         {
             std::println(stderr, "[过滤特征] 读取文件失败: {}", filename);
             return result;
@@ -1434,7 +1478,7 @@ namespace SignatureScanner
         size_t totalSize = static_cast<size_t>(range) * 2;
         std::vector<uint8_t> curData(totalSize);
 
-        if (dr.Read(addr - range, curData.data(), totalSize) != 0)
+        if (dr.Read(addr - range, curData.data(), totalSize) <= 0)
         {
             std::println(stderr, "[过滤特征] 读取失败: 0x{:X}", addr - range);
             return result;
@@ -1469,7 +1513,7 @@ namespace SignatureScanner
         result.oldSignature = oldSigText;
         result.newSignature = FormatSignature(newSig);
 
-        WriteSigFile(filename, addr, range, newSig);
+        WriteSigFileWithFallback(filename, addr, range, newSig);
 
         result.success = true;
         std::println("[过滤特征] 完成 总字节:{} 变化:{}", result.totalCount, result.changedCount);
@@ -1496,7 +1540,7 @@ namespace SignatureScanner
     {
         int range = 0;
         std::string sigText;
-        if (!ReadSigFile(filename, range, sigText))
+        if (!ReadSigFileWithFallback(filename, range, sigText))
         {
             std::println(stderr, "[扫特征码] 读取文件失败: {}", filename);
             return {};
@@ -1510,7 +1554,8 @@ namespace SignatureScanner
         auto matches = ScanCore(sig, range);
         std::println("[扫特征码] 完成 找到 {} 个匹配", matches.size());
 
-        std::ofstream out(filename, std::ios::app);
+        const std::string outPath = ResolveSigPath(NormalizeSigFileName(filename));
+        std::ofstream out(outPath, std::ios::app);
         if (out)
         {
             std::println(out, "\n扫描结果: {} 个", matches.size());
