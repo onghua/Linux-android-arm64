@@ -83,12 +83,15 @@ inline int mainno()
             testVar = 0xDEADBEEFCAFEBABE;
             uint64_t readResult = 0;
             r.readFailCount = 0;
+            size_t readTransferred = 0;
 
             auto t0 = std::chrono::high_resolution_clock::now();
             for (int i = 0; i < TEST_COUNT; ++i)
             {
-                readResult = dr.Read<uint64_t>(testAddr);
-                if (readResult != 0xDEADBEEFCAFEBABE)
+                int readBytes = dr.Read(testAddr, &readResult, sizeof(readResult));
+                if (readBytes > 0)
+                    readTransferred += static_cast<size_t>(readBytes);
+                if (readBytes != static_cast<int>(sizeof(readResult)) || readResult != 0xDEADBEEFCAFEBABE)
                     r.readFailCount++;
             }
             auto t1 = std::chrono::high_resolution_clock::now();
@@ -99,18 +102,21 @@ inline int mainno()
             r.readAvgNs = static_cast<double>(ns) / TEST_COUNT;
             r.readNetAvgNs = r.readAvgNs - r.nullIoAvgNs;
             r.readThroughputK = (TEST_COUNT / totalS) / 1000.0;
-            r.readBandwidthMB = (TEST_COUNT * 8.0) / totalS / (1024.0 * 1024.0);
+            r.readBandwidthMB = static_cast<double>(readTransferred) / totalS / (1024.0 * 1024.0);
         }
 
         {
             r.writeFailCount = 0;
+            size_t writeTransferred = 0;
 
             auto t0 = std::chrono::high_resolution_clock::now();
             for (int i = 0; i < TEST_COUNT; ++i)
             {
                 uint64_t wv = 0x1000000000000000ULL + static_cast<uint64_t>(i);
-                bool ok = dr.Write<uint64_t>(testAddr, wv);
-                if (ok)
+                int writeBytes = dr.Write(testAddr, &wv, sizeof(wv));
+                if (writeBytes > 0)
+                    writeTransferred += static_cast<size_t>(writeBytes);
+                if (writeBytes != static_cast<int>(sizeof(wv)))
                     r.writeFailCount++;
             }
             auto t1 = std::chrono::high_resolution_clock::now();
@@ -121,7 +127,7 @@ inline int mainno()
             r.writeAvgNs = static_cast<double>(ns) / TEST_COUNT;
             r.writeNetAvgNs = r.writeAvgNs - r.nullIoAvgNs;
             r.writeThroughputK = (TEST_COUNT / totalS) / 1000.0;
-            r.writeBandwidthMB = (TEST_COUNT * 8.0) / totalS / (1024.0 * 1024.0);
+            r.writeBandwidthMB = static_cast<double>(writeTransferred) / totalS / (1024.0 * 1024.0);
         }
 
         r.readOverheadPct = (r.nullIoAvgNs / r.readAvgNs) * 100.0;

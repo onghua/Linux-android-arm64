@@ -380,12 +380,12 @@ public: // 外部读写接口
     }
 
     template <typename T>
-    bool Write(uint64_t address, const T &value)
+    int Write(uint64_t address, const T &value)
     {
         return KWriteProcessMemory(address, const_cast<T *>(&value), sizeof(T));
     }
 
-    bool Write(uint64_t address, void *buffer, size_t size)
+    int Write(uint64_t address, void *buffer, size_t size)
     {
         return KWriteProcessMemory(address, buffer, size);
     }
