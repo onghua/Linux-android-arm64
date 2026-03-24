@@ -17,6 +17,7 @@
 #include "physical.h"
 #include "hwbp.h"
 #include "virtual_input.h"
+#include "process_memory_enum.h"
 
 static struct req_obj *req = NULL;
 

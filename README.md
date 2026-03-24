@@ -1,354 +1,287 @@
-# 内存调试分析驱动
+# lsdriver 驱动说明（以当前源码为准）
 
 > 仅供技术研究与学习，严禁用于非法用途。作者不承担任何违法责任。
 
-本项目通过 **Context Cache** 与 **Software TLB** 两级软件优化，实现接近硬件物理极限的读写性能。
-
 交流群：
-TG:https://t.me/+ArHIx-Km9jkxNjZl
+TG:https://t.me/+ArHIx-Km9jkxNjZl  
 QQ:1092055800
 
-## 目录
+---
 
-- [第一部分：两种读写方案的实现细节与原理](#第一部分两种读写方案的实现细节与原理)
-- [第二部分：代码中的性能优化点](#第二部分代码中的性能优化点)
-- [第三部分：共享内存通信机制解析](#第三部分共享内存通信机制解析)
-- [第四部分：无干扰虚拟触摸分析](#第四部分无干扰虚拟触摸分析)
-- [如何编译](#如何编译)
+## 1. 项目定位
+
+`lsdriver` 是一个基于共享内存协议的内核模块，当前代码实现了以下能力：
+
+1. 进程内存读写（`op_r` / `op_w`）
+2. 进程内存布局枚举（`op_m`）
+3. 虚拟触摸注入（`op_init_touch` / `op_down` / `op_move` / `op_up`）
+4. ARM64 硬件断点管理与命中记录（`op_set_process_hwbp` / `op_remove_process_hwbp` / `op_brps_weps_info`）
+5. 内核工作线程退出控制（`op_kexit`）
+
+注意：当前驱动通信方式是“用户进程共享内存 + 内核线程轮询”，没有 `ioctl`/`netlink`/`procfs` 命令接口。
 
 ---
 
-## 第一部分：两种读写方案的实现细节与原理
+## 2. 代码结构
 
-### 方案 1：PTE 重映射（PTE Remapping / Windowing）
+`lsdriver/` 目录下核心文件：
 
-- **对应函数**：`allocate_physical_page_info`（初始化）、`_internal_read_fast`、`_internal_write_fast`
-
-#### 原理
-
-核心思想是“偷梁换柱”：先申请一页合法虚拟内存（作为“窗口”），再手动修改该页对应的 PTE，将其 PFN 指向目标物理地址，实现对任意物理地址的读写。
-
-#### 实现细节
-
-1. **初始化（`allocate_physical_page_info`）**
-   - 使用 `vmalloc(PAGE_SIZE)` 分配一页内核虚拟内存。
-   - 通过 `memset` 触发缺页，确保建立页表映射。
-   - 读取 ARM64 寄存器 `TTBR1_EL1`，手动遍历 `PGD -> P4D -> PUD -> PMD -> PTE`。
-   - 定位并保存窗口页对应的 PTE 地址（`info.pte_address`）。
-2. **读写过程（`_internal_read_fast`）**
-   - 将目标物理地址 `paddr` 转换为 PFN。
-   - 使用 `set_pte` 修改保存的 `info.pte_address`，并设置 `MT_NORMAL`、`PTE_VALID` 等属性。
-   - 调用 `flush_tlb_kernel_range` 刷新 TLB，避免命中旧映射。
-   - 最终通过访问 `info.base_address` 完成对目标物理地址的数据读写。
-
-#### 优缺点
-
-- **优点**：可访问范围广，覆盖普通 RAM、设备寄存器（如配 `MT_DEVICE`）及部分非线性映射区域。
-- **缺点**：每次读写都涉及改 PTE + 刷 TLB，开销较高。
-
-#### 实测
-
-- 共享内存通信下，执行 `1,000,000` 次读操作，用户层 -> 内核层 -> 用户层平均约 **1us**。
-- 2025-11-27 记录：单线程且不加自旋锁时，可接近 **0.5us**。
-
-<img width="1399" height="452" alt="image" src="https://github.com/user-attachments/assets/9d7a8215-4cd8-4f46-9ea3-5a183630e0bc" />
+- `lsdriver.c`：模块入口、连接线程、调度线程、进程退出监听、模块/线程隐藏逻辑
+- `io_struct.h`：共享内存协议定义（操作码、请求结构、返回结构）
+- `physical.h`：进程内存读写与内存布局枚举实现
+- `virtual_input.h`：虚拟触摸注入实现
+- `hwbp.h`：ARM64 用户态硬件断点实现
+- `export_fun.h`：`kallsyms_lookup_name` 获取与 CFI/KCFI 兼容调用封装
+- `Makefile`：模块编译参数
 
 ---
 
-### 方案 2：线性映射直接访问（Linear Mapping / Phys-to-Virt）
+## 3. 运行架构
 
-- **对应函数**：`_internal_read_fast_linear`、`_internal_write_fast_linear`
+模块初始化后会启动两个内核线程：
 
-#### 原理
+1. `ConnectThreadFunction`
+2. `DispatchThreadFunction`
 
-利用 ARM64 Linux 的线性映射区（Direct/Linear Mapping）。在该模型中，大部分系统 RAM 会被映射到固定的内核虚拟地址偏移（`PAGE_OFFSET`）上。
+### 3.1 连接线程（Connect）
 
-#### 实现细节
+行为：
 
-1. **合法性检查**
-   - 使用 `pfn_valid(__phys_to_pfn(paddr))` 判断目标地址是否属于有效系统 RAM。
-2. **地址转换**
-   - 直接调用 `phys_to_virt(paddr)`。
-   - 在 ARM64 上本质是常量偏移加法，不需要页表遍历和 TLB 刷新。
-3. **读写**
-   - 得到内核虚拟地址后，直接解引用或 `memcpy` 读写。
+1. 周期遍历进程列表，查找 `task->comm == "LS"` 的进程。
+2. 对固定用户地址 `0x2025827000` 执行 `get_user_pages_remote`，把请求结构体所在页 pin 住。
+3. 通过 `vmap` 把这些页映射成内核可访问虚拟地址，赋给全局 `req`。
+4. 设置 `ProcessExit=1`，并设置 `req->user=1` 通知用户侧“连接完成”。
 
-#### 优缺点
+内核版本分支：
 
-- **优点**：速度极快，无改页表与刷 TLB 开销。
-- **缺点**：仅适用于线性映射覆盖的内存（主要是 RAM）；I/O 或保留区地址可能失败。
+- 5.10 / 5.15 / 6.1 / 6.5 / 6.12 通过条件编译适配了 `get_user_pages_remote` 参数签名差异。
 
-#### 实测
+### 3.2 调度线程（Dispatch）
 
-- 共享内存通信下，执行 `1,000,000` 次读操作，用户层 -> 内核层 -> 用户层平均约 **0.3us**。
+行为：
 
-<img width="837" height="263" alt="屏幕截图 2025-12-18 175005" src="https://github.com/user-attachments/assets/113f3168-67a1-4572-a549-3559c517b058" />
+1. 仅在 `ProcessExit=1` 时处理请求。
+2. 通过 `atomic_read(req->kernel)` 判断是否有请求待处理。
+3. 通过 `atomic_xchg(&req->kernel, 0)` 抢占请求处理权。
+4. 按 `req->op` 分发到内存读写、内存枚举、虚拟触摸、硬件断点等函数。
+5. 处理完成后 `atomic_set(&req->user, 1)` 通知用户侧结果可读。
 
----
+轮询策略：
 
-## 第二部分：代码中的性能优化点
-
-涉及函数：`read_process_memory`、`write_process_memory` 及底层读写路径。
-
-### 1. 进程上下文缓存（MM Struct Caching）
-
-- **位置**：`read_process_memory` 开头静态变量。
-
-```c
-static pid_t s_last_pid = 0;
-static struct mm_struct *s_last_mm = NULL;
-```
-
-- **原理**：若连续读取同一进程，则复用上次 `mm_struct`，减少 `get_pid_task` / `get_task_mm` 的查找与引用计数开销。
-
-### 2. 局部页缓存（Software TLB / Loop Optimization）
-
-- **位置**：`read_process_memory` 的 `while` 循环内部。
-
-```c
-static uint64_t loop_last_vpage_base = -1;
-static phys_addr_t loop_last_ppage_base = 0;
-
-if ((current_vaddr & PAGE_MASK) == loop_last_vpage_base) {
-    paddr_of_page = loop_last_ppage_base;
-} else {
-    // 只有跨页时才走页表遍历
-    status = manual_va_to_pa_arm(...);
-    ...
-}
-```
-
-- **原理**：大多数连续读取落在同一页内，命中缓存时直接复用 VA -> PA 结果，避免重复页表遍历。
-
-### 3. 小内存访问特化（Switch-Case Unrolling）
-
-- **位置**：`_internal_read_fast` 与 `_internal_read_fast_linear` 中的 `switch (size)`。
-
-```c
-switch (size) {
-    case 4: *(uint32_t *)buffer = ...; break;
-    case 8: *(uint64_t *)buffer = ...; break;
-    ...
-    default: memcpy(...); break;
-}
-```
-
-- **原理**：对 1/2/4/8 字节常见读写优先走直接赋值，减少通用 `memcpy` 的函数与对齐处理开销。
-
-### 4. 使用 `READ_ONCE` / `WRITE_ONCE`
-
-- **位置**：直接内存访问路径。
-- **原理**：约束编译器优化，降低撕裂读写风险（在对齐前提下）。
-
-### 5. 分支预测优化（`likely` / `unlikely`）
-
-- **位置**：错误检查等冷路径。
-- **原理**：让编译器布局热路径，减少分支预测失败带来的流水线损失。
-
-### 6. 页表遍历中的大页支持
-
-- **位置**：`allocate_physical_page_info` 与 `manual_va_to_pa_arm`。
-
-```c
-if (pmd_leaf(*pmd)) { ... } // 检查是否为大页
-```
-
-- **原理**：正确处理 Block Mapping（2MB/1GB）避免错误下钻导致的地址错误或崩溃。
-
-### 总结与对比
-
-实际在 `read_process_memory` 中主用 **方案 2（线性映射）**。
-
-- **方案 1 的定位**：更偏向演示或特殊场景（如设备寄存器、非线性映射区）。
-- **方案 2 的优势**：读写常规 RAM 时，性能明显更优。
+- 前 `5000` 轮 `cpu_relax()` 忙等，追求低延迟响应。
+- 后续 `usleep_range(50, 100)`，降低空闲功耗。
 
 ---
 
-## 第三部分：共享内存通信机制解析
+## 4. 共享内存协议
 
-本代码使用 **用户-内核共享内存（User-Kernel Shared Memory）** 作为主要通信桥梁，替代 `ioctl`、`netlink`、`procfs` 等方式。
+协议结构定义在 `io_struct.h` 的 `struct req_obj`。
 
-### 机制实现
+### 4.1 同步字段
 
-1. **固定地址协商**：约定固定虚拟地址 `0x2025827000`。
-2. **反向映射**：用户态通过 `mmap` 与内核共享同一片内存。
-3. **无锁自旋同步**：使用状态位 + `atomic_xchg` + `cpu_relax()` 进行低延迟握手。
-4. **动态策略**：空闲时降低消耗，有任务时快速唤醒与高频轮询。
+- `kernel`：用户侧置 1，表示内核有待处理请求
+- `user`：内核侧置 1，表示用户可读取结果
 
-### 优势
+### 4.2 主要请求字段
 
-1. **零拷贝**：内核和用户态直接读写同一内存，减少上下文切换与拷贝开销。
-2. **高吞吐**：主要受限于内存带宽与 CPU 处理速度。
-3. **低延迟**：请求到达后可在极短周期内被检测并响应。
-4. **痕迹少**：用户态主要做内存读写，系统调用路径更短。
+- `op`：操作码（`enum sm_req_op`）
+- `status`：返回状态 / 返回长度
+- `pid`, `target_addr`, `size`, `user_buffer[0x1000]`：读写参数与数据缓冲
+- `mem_info`：内存布局枚举结果
+- `bt`, `bs`, `len_bytes`, `bp_info`：硬件断点参数/结果
+- `POSITION_X`, `POSITION_Y`, `x`, `y`：触摸初始化返回与触摸坐标
 
-### 风险
+### 4.3 操作码
 
-1. 用户态异常或恶意数据可能导致共享区状态损坏，触发内核崩溃。
-2. 进程异常退出后若缺少恢复流程，可能无法重连。
-3. 共享区被释放但内核仍访问，会触发非法访问。
-4. 直接解引用未映射指针容易崩溃，参数校验必须严格。
-5. 极低延迟策略会提高功耗，需要在性能与能耗之间折中。
-
----
-
-## 第四部分：无干扰虚拟触摸分析
-
-### 1. 核心策略：制造“盲区”
-
-- 物理触摸驱动通常会循环清理未上报槽位：`for (i = 0; i < num_slots; i++)`。
-- 若 `num_slots = 10`，Slot 9 会被物理驱动在下一帧清掉。
-- 将 `dev->mt->num_slots` 改为 `9` 后，物理驱动只处理 0-8，Slot 9 变为“盲区”。
-
-### 2. Android 层的“盲区”对齐
-
-- InputReader 常按 10 点触控（0-9）处理。
-- 即使驱动侧改成 9 槽，也要用 `input_set_abs_params` 告诉 Android 支持到 Slot 9，否则会被判定为非法数据丢弃。
-
-### 3. 内核层“按键抖动”问题
-
-- 现象：`BTN_TOUCH` / `BTN_TOOL_FINGER` 高频 UP/DOWN 抖动。
-- 原因：`input_mt_sync_frame()` 在默认 `INPUT_MT_POINTER` 行为下会自动汇总并发 UP。
-- 处理：`new_mt->flags &= ~INPUT_MT_POINTER;`，改为手动控制按键上报。
-
-### 4. 动态开关 Slot（量子态 Slot）
-
-- 问题：固定 `num_slots = 9` 会导致 `input_mt_sync_frame` 不处理 Slot 9。
-- 方案：发送期间短暂切换到 10，再立即切回 9。
-
-```c
-dev->mt->num_slots = 10; // 1. 瞬时打开
-input_mt_slot(..., 9);   // 2. 写入 Slot 9
-input_mt_sync_frame(...);// 3. 打包发送
-dev->mt->num_slots = 9;  // 4. 立即恢复
-```
-
-### 5. 防误触机制（面积与压力）
-
-- 若 `ABS_MT_TOUCH_MAJOR = 0` 或 `ABS_MT_PRESSURE = 0`，可能被系统当作无效触点。
-- 通过构造有效值（例如 `MAJOR = 10`, `PRESSURE = 60`）提升触点可信度。
-
-### 6. 总结
-
-核心是在三个层面做一致性控制：
-
-1. 对物理驱动：`num_slots = 9`，保护 Slot 9。
-2. 对 Android：声明支持到 Slot 9，避免上层丢弃。
-3. 对内核输入框架：关闭自动 POINTER 聚合并在发送时瞬时开放 Slot 9。
-
-相关演示：
-https://github.com/user-attachments/assets/53039be7-a21f-43ed-ac17-8bb3a841a93f
+- `op_o`：空调用
+- `op_r`：读内存
+- `op_w`：写内存
+- `op_m`：枚举内存布局
+- `op_down` / `op_move` / `op_up`：触摸按下/移动/抬起
+- `op_init_touch`：初始化触摸
+- `op_brps_weps_info`：读取 CPU 断点资源数量
+- `op_set_process_hwbp`：设置硬件断点
+- `op_remove_process_hwbp`：删除硬件断点
+- `op_kexit`：结束内核线程循环
 
 ---
 
-## 如何编译
+## 5. 内存读写实现（`physical.h`）
 
-理论上，4.x ~ 6.x 内核在改动不大时均可编译；若失败请按目标内核自行适配。
+代码中保留两套“物理读写后端”：
 
-### 第 0 步：准备环境
+1. PTE 重映射（方案 1）
+2. 线性映射读写（方案 2）
 
-下载对应通用内核源码，并准备 Linux 构建环境。
+当前默认路径是：**手动页表翻译 VA->PA + 线性映射读写物理内存**。
 
-> 可选：使用 `build_all.sh`，并配置 `KERNELS_ROOT`、`DRIVER_SRC`；也可按下方手动编译。
+### 5.1 进程读写主流程
 
-### 第 1 步：清理编译环境
+入口函数：
 
-```bash
-tools/bazel clean --expunge
-```
+- `read_process_memory(...)`
+- `write_process_memory(...)`
+- 实际都走 `_process_memory_rw(...)`
 
-### 第 2 步：使用 Bazel 编译内核
+关键优化：
 
-```bash
-tools/bazel build //common:kernel_aarch64
-```
+1. `mm_struct` 缓存：`s_last_pid` / `s_last_mm`
+2. 软件页缓存：`s_last_vpage_base` / `s_last_ppage_base`
+3. 按页循环处理，自动拆分跨页访问
 
-### 第 3 步：准备模块编译输出目录（一次性）
+地址翻译：
 
-```bash
-cd $(readlink -f bazel-bin/common/kernel_aarch64)
-tar -xzf ../kernel_aarch64_modules_prepare/modules_prepare_outdir.tar.gz
-```
+- 当前实际启用：`walk_translate_va_to_pa(...)`
+- 保留但未启用：`mmu_translate_va_to_pa(...)`（AT 指令 + TTBR0 切换方案）
 
-### 第 4 步：配置外部模块编译环境变量
+物理读写：
 
-```bash
-export PATH=/root/6.1/prebuilts/clang/host/linux-x86/clang-r487747c/bin:$PATH
-export PATH=/root/android13-5.10/prebuilts/clang/host/linux-x86/clang-r450784e/bin:$PATH
-export PATH=/root/5.15/prebuilts/clang/host/linux-x86/clang-r450784e/bin:$PATH
-export PATH=/root/6.6/prebuilts/clang/host/linux-x86/clang-r510928/bin:$PATH
-```
+- 当前实际启用：`linear_read_physical` / `linear_write_physical`
+- 保留但未启用：`pte_read_physical` / `pte_write_physical`
 
-### 第 5 步：编译外部内核模块
+返回值语义：
 
-#### 版本 1：内核 6.1
+- 成功：返回成功处理的字节数
+- 失败：返回负错误码（如 `-EFAULT`、`-EINVAL`）
 
-```bash
-make -C /root/6.1/common \
-O=$(readlink -f bazel-bin/common/kernel_aarch64) \
-M=/mnt/e/1.CodeRepository/Android/Kernel/lsdriver \
-ARCH=arm64 \
-LLVM=1 \
-LLVM_TOOLCHAIN_PATH=/root/6.1/prebuilts/clang/host/linux-x86/clang-r487747c \
-CROSS_COMPILE=/root/6.1/prebuilts/ndk-r23/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android- \
-modules V=1
-```
+### 5.2 进程内存布局枚举（`enum_process_memory`）
 
-#### 版本 2：Android 13 / 5.10
+`memory_info` 输出两类数据：
 
-```bash
-make -C /root/android13-5.10/common \
-O=$(readlink -f bazel-bin/common/kernel_aarch64) \
-M=/mnt/e/1.CodeRepository/Android/Kernel/lsdriver \
-ARCH=arm64 \
-LLVM=1 \
-LLVM_TOOLCHAIN_PATH=/root/android13-5.10/prebuilts/clang/host/linux-x86/clang-r450784e \
-CROSS_COMPILE=/root/android13-5.10/prebuilts/ndk-r23/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android- \
-KBUILD_MODPOST_WARN=1 \
-modules V=1
-```
+1. `modules[]`：模块段信息（含 index/prot/start/end）
+2. `regions[]`：可扫描私有 RW 区域（`rw-p`）
 
-#### 版本 3：内核 5.15
+模块采集规则（当前代码）：
 
-```bash
-make -C /root/5.15/common \
-O=$(readlink -f bazel-bin/common/kernel_aarch64) \
-M=/mnt/e/1.CodeRepository/Android/Kernel/lsdriver \
-ARCH=arm64 \
-LLVM=1 \
-LLVM_TOOLCHAIN_PATH=/root/5.15/prebuilts/clang/host/linux-x86/clang-r450784e \
-CROSS_COMPILE=/root/5.15/prebuilts/ndk-r23/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android- \
-modules V=1
-```
+- 仅收集路径前缀命中 `/data/` 的文件映射
+- 额外支持把匿名且紧邻前一模块段的可写区段识别为 BSS（`index=-1`）
+- 兼容 BSS 只有 `-w-p` 的情况
 
-#### 版本 4：内核 6.6
+扫描区过滤规则（当前代码）：
 
-```bash
-make -C /root/6.6/common \
-O=$(readlink -f bazel-bin/common/kernel_aarch64) \
-M=/mnt/e/1.CodeRepository/Android/Kernel/lsdriver \
-ARCH=arm64 \
-LLVM=1 \
-LLVM_IAS=1 \
-CLANG_TRIPLE=aarch64-linux-gnu- \
-CROSS_COMPILE=aarch64-linux-gnu- \
-modules V=1
-```
+- 排除路径前缀：`/dev/`, `/system/`, `/vendor/`, `/apex/`
+- 排除关键词：`.oat`, `.art`, `.odex`, `.vdex`, `.dex`, `.ttf`, `dalvik`, `gralloc`, `ashmem`
+- 排除匿名栈区、`[vvar]/[vdso]/[vsyscall]`
 
-### 第 6 步：剥离调试符号并生成版本化模块
+后处理算法（当前实现）：
 
-```bash
-# 内核 6.1
-/root/6.1/prebuilts/clang/host/linux-x86/clang-r487747c/bin/llvm-strip --strip-debug -o /mnt/e/1.CodeRepository/Android/Kernel/lsdriver/6.1lsdriver.ko /mnt/e/1.CodeRepository/Android/Kernel/lsdriver/lsdriver.ko
-
-# Android 13 5.10
-/root/android13-5.10/prebuilts/clang/host/linux-x86/clang-r450784e/bin/llvm-strip --strip-debug -o /mnt/e/1.CodeRepository/Android/Kernel/lsdriver/13-5.10lsdriver.ko /mnt/e/1.CodeRepository/Android/Kernel/lsdriver/lsdriver.ko
-
-# 内核 5.15
-/root/5.15/prebuilts/clang/host/linux-x86/clang-r450784e/bin/llvm-strip --strip-debug -o /mnt/e/1.CodeRepository/Android/Kernel/lsdriver/5.15lsdriver.ko /mnt/e/1.CodeRepository/Android/Kernel/lsdriver/lsdriver.ko
-
-# 内核 6.6
-/root/6.6/prebuilts/clang/host/linux-x86/clang-r510928/bin/llvm-strip --strip-debug -o /mnt/e/1.CodeRepository/Android/Kernel/lsdriver/6.6lsdriver.ko /mnt/e/1.CodeRepository/Android/Kernel/lsdriver/lsdriver.ko
-```
+1. 物理地址排序
+2. 体积聚类选主干（16MB 断层阈值）
+3. 过滤远端诱饵并保留尾部 BSS 豁免
+4. 拓扑重标记（RO/RX/RW/BSS）
+5. `prot` 规范化（含 BSS `-w-` 修正为 RW）
+6. 相邻同类段拉链式合并
+7. 最终 index 连续化（BSS 保持 `-1`）
 
 ---
+
+## 6. 虚拟触摸实现（`virtual_input.h`）
+
+核心常量：
+
+- `TARGET_SLOT_IDX = 9`
+- `PHYSICAL_SLOTS = 9`
+- `TOTAL_SLOTS = 10`
+
+核心思路：
+
+1. 劫持 `input_dev->mt`，分配新 `input_mt`，保留至少 10 个 slot 存储空间。
+2. 对物理驱动暴露 `num_slots=9`，让其只处理 `0..8`。
+3. 对系统上报 `ABS_MT_SLOT` 范围到 `10`（0..9）。
+4. 发送虚拟触摸时瞬时把 `num_slots` 切到 10，写入 slot 9 后再切回 9。
+5. 手动维护 `BTN_TOUCH` / `BTN_TOOL_FINGER` / `BTN_TOOL_DOUBLETAP`。
+
+关键实现点：
+
+- 关闭 `INPUT_MT_POINTER`，防止按键状态抖动
+- 发送过程 `local_irq_save/restore` 降低真实中断打断导致的帧污染
+- 自动伪造 `TOUCH_MAJOR/WIDTH_MAJOR/PRESSURE`（设备支持时）
+- `v_touch_destroy()` 恢复原始 `mt` 并释放劫持资源
+
+---
+
+## 7. 硬件断点实现（`hwbp.h`）
+
+能力：
+
+1. 获取当前 CPU BRP/WRP 资源数量（读 `id_aa64dfr0_el1`）
+2. 给目标进程线程设置用户态硬件断点（R/W/RW/X）
+3. 删除已注册断点
+4. 记录命中 PC、命中次数、寄存器快照
+
+实现要点：
+
+- 通过 `register_user_hw_breakpoint` / `unregister_hw_breakpoint` 动态解析符号地址
+- `sample_hbp_handler()` 在回调中记录/回放寄存器，并调用 `emulate_insn(regs)` 步过指令
+- 断点事件维护在全局链表 `bp_event_list`
+
+---
+
+## 8. 模块可见性处理（`lsdriver.c`）
+
+初始化时会执行隐藏逻辑：
+
+1. 从 `vmap_area_list` 和 `vmap_area_root` 摘除自身映射节点
+2. 从 `THIS_MODULE->list` 摘除（`/proc/modules` 不可见）
+3. 删除 `mkobj.kobj`（`/sys/module` 不可见）
+4. 清理模块依赖 holder 链接
+5. 工作线程从 `task->tasks` 链表摘除
+
+另外，注册了 `do_exit` 的 kprobe：
+
+- 主线程退出时（`thread_group_leader`）若进程名包含 `ls`/`LS`，执行状态清理（重置连接状态、触摸销毁等）。
+
+---
+
+## 9. 编译说明
+
+### 9.1 直接编译模块（通用）
+
+在目标内核源码树执行：
+
+```bash
+make -C <KDIR> M=$PWD/lsdriver ARCH=arm64 LLVM=1 modules
+```
+
+### 9.2 模块 Makefile 当前关键参数
+
+- `obj-m += lsdriver.o`
+- `ccflags-y += -O3`
+- `ccflags-y += -Wno-error`
+- `ccflags-y += -fno-stack-protector`
+- `ccflags-y += -fomit-frame-pointer`
+- `ccflags-y += -funroll-loops`
+- `ccflags-y += -fstrict-aliasing`
+- `ccflags-y += -ffunction-sections -fdata-sections`
+
+### 9.3 仓库内已有产物（`lsdriver/`）
+
+- `android12-5.10lsdriver.ko`
+- `android13-5.10lsdriver.ko`
+- `android13-5.15lsdriver.ko`
+- `android14-6.1lsdriver.ko`
+- `android15-6.6lsdriver.ko`
+- `android16-6.12lsdriver.ko`
+
+---
+
+## 10. 使用前提与限制（按当前代码）
+
+1. 用户进程名必须是 `LS`（连接线程硬编码匹配）。
+2. 共享内存虚拟地址固定为 `0x2025827000`。
+3. 单次读写缓冲 `user_buffer` 固定 `0x1000` 字节。
+4. 模块初始化后立即做隐藏处理，常规 `rmmod` 流程不适合作为回收路径。
+5. 触摸和断点逻辑依赖 ARM64 输入子系统/硬件断点能力，不同设备内核行为可能有差异。
+
+---
+
+## 11. 后续维护建议
+
+如果你后续继续改驱动代码，建议 README 同步关注这几块：
+
+1. `enum sm_req_op` 变更（协议兼容）
+2. `req_obj` 结构变更（用户态同步）
+3. 连接条件（进程名、共享地址、握手机制）
+4. 内存读写后端切换（PTE vs 线性映射）
+5. 触摸/断点能力开关与版本适配分支
+

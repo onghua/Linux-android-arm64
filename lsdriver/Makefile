@@ -1,4 +1,4 @@
-# 用于编译进内核
+# 用于编译进内核boot
 #obj-$(CONFIG_LSDRIVER) += lsdriver.o
 
 

@@ -12,6 +12,8 @@
 
 # 忽略 VS Code 配置
 .vscode/
+.claude/
+.codex/
 # Android-LS build outputs
 Android-LS/obj/
 Android-LS/libs/
@@ -24,6 +26,7 @@ Android-LS/libomp.so
 
 # VS Code settings in subdirectories
 **/.vscode/
+
 
 # Android Studio / Gradle / NDK outputs
 .gradle/
